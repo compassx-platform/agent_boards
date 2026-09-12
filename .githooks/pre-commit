@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Git identity check: reject commits made without a real user.name / user.email.
+# Prevents placeholder identities (e.g. "opencode <opencode@localhost>") from
+# leaking into the commit history.
+set -euo pipefail
+
+name="$(git config --get user.name 2>/dev/null || true)"
+email="$(git config --get user.email 2>/dev/null || true)"
+
+fail() {
+    echo "pre-commit: git identity check failed: $1" >&2
+    exit 1
+}
+
+if [[ -z "$name" || -z "$email" ]]; then
+    fail "user.name/user.email not set. Fix with:
+  git config user.name \"Your Name\"
+  git config user.email \"you@example.com\")"
+fi
+
+placeholder_re='(opencode|your ?name|your ?email|you@example|^your |localhost|example\.com)'
+if printf '%s\n%s\n' "$name" "$email" | grep -qEi "$placeholder_re"; then
+    fail "identity looks like a placeholder: \"$name <$email>\". Set a real identity:
+  git config user.name \"Your Name\"
+  git config user.email \"you@example.com\""
+fi
+
+exit 0

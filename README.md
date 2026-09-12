@@ -97,6 +97,19 @@ Note: the default SQLite DB lives under `/root/.taskexec` because the
 `/workspaces` mount in this environment is CIFS/SMB where SQLite file-locking is
 unreliable. Point `TASKEXEC_DATABASE_URL` at Postgres for production.
 
+## Git identity check
+
+A pre-commit hook (`.githooks/pre-commit`) rejects commits made with a missing
+or placeholder `user.name`/`user.email`. Set a real identity before committing:
+
+```bash
+git config user.name "Your Name"
+git config user.email "you@example.com"
+```
+
+The hook is already wired via `core.hooksPath` in this repo; it activates on
+`git commit` for anyone who clones it.
+
 ## Swapping the agent
 
 Implement `AgentAdapter` (`submit` / `poll` / `get_result` / `cancel`) in
