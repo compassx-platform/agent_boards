@@ -15,9 +15,9 @@ def utcnow() -> datetime:
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "backlog": {"queued", "blocked", "rejected"},
     "queued": {"executing", "blocked", "rejected"},
-    "executing": {"verifying", "blocked", "rejected", "queued"},
+    "executing": {"verifying", "blocked", "rejected", "queued", "needs_review"},
     "verifying": {"done", "needs_review", "executing", "blocked", "rejected"},
-    "needs_review": {"done", "executing", "rejected", "blocked"},
+    "needs_review": {"done", "executing", "rejected", "blocked", "queued"},
     "blocked": {"queued", "rejected"},
 }
 

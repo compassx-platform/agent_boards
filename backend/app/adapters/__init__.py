@@ -20,6 +20,8 @@ class ExecutionResult:
     tools_used: list[str] = field(default_factory=list)
     logs_ref: str = ""
     success: bool = True
+    plan: str = ""
+    pr_url: str = ""
 
 
 class AgentAdapter(abc.ABC):
@@ -30,9 +32,20 @@ class AgentAdapter(abc.ABC):
     @abc.abstractmethod
     def supports_capability(self, capability: str) -> bool: ...
 
+    def is_planner(self) -> bool:
+        """Whether this adapter can produce an implementation plan (phase=plan)."""
+        return True
+
     @abc.abstractmethod
-    async def submit(self, task: Task, attempt_number: int, attempt_id: str, artifacts_dir: str) -> str:
-        """Start execution, return opaque execution_id."""
+    async def submit(
+        self,
+        task: Task,
+        attempt_number: int,
+        attempt_id: str,
+        artifacts_dir: str,
+        phase: str = "execute",
+    ) -> str:
+        """Start execution, return opaque execution_id. phase ∈ plan|implement|execute."""
 
     @abc.abstractmethod
     async def poll(self, execution_id: str) -> ExecutionStatus:

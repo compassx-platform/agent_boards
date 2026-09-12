@@ -7,6 +7,8 @@ Backend: **FastAPI** (Python) · Frontend: **React + Vite + TypeScript**
 
 ## Lifecycle
 
+Standard tasks:
+
 ```
 backlog → queued → executing → verifying ─┬─→ done            (auto-approved)
                                           ├─→ executing       (verified fail, auto-retry w/ backoff)
@@ -14,6 +16,21 @@ backlog → queued → executing → verifying ─┬─→ done            (aut
 needs_review → done | executing (retry) | rejected
 blocked → queued (manual unblock)
 ```
+
+Plan-first tasks (`plan_required: true`) run **two agent phases** with a human gate
+between them — plan first, approve it, then implement into a PR branch:
+
+```
+backlog → queued → executing(plan) → needs_review (plan_status=awaiting_approval)
+                        │  approve_plan  │
+                        ▼                │
+                 queued → executing(implement) → verifying → done (+ pr_url)
+            (plan failure ⇒ plan_status=failed, task escalates for review)
+```
+
+Review actions now include `approve_plan` (accept the agent's plan and start
+implementation) in addition to `approve | retry | reject`. Plan text, phase, and
+any PR URL are stored on the task and surfaced in the UI/API.
 
 Risk gating (defaults, admin-configurable):
 
@@ -40,9 +57,9 @@ backend/
     ├── orchestrator.py     # background worker: queue, attempts, verification, gating
     ├── verification.py     # automated_test / schema_check / output_match / human checks
     ├── adapters/
-    │   ├── __init__.py     # AgentAdapter interface + factory
-    │   ├── simulated.py    # local deterministic agent (dev)
-    │   └── omnigent.py     # real Omnigent adapter skeleton (set TASKEXEC_ADAPTER=omnigent)
+    │   ├── __init__.py     # AgentAdapter interface + factory (ExecutionResult: output/plan/pr_url)
+    │   ├── simulated.py    # local deterministic agent (dev, phase-aware: plan → PR)
+    │   └── omnigent.py     # real Omnigent adapter (submit/poll/get_result/cancel vs live server)
     └── api/router.py       # REST endpoints + SSE stream + demo seed
 frontend/
 └── src/
@@ -72,10 +89,19 @@ A demo set of tasks is seeded automatically on first start (`POST /api/v1/demo/s
 to add more). To see the auto-retry path, put `(fail_once)` in a task's intent —
 the simulated agent deliberately fails the first attempt.
 
+## Plan-first flow
+
+Create a task with `plan_required: true` (the UI has a toggle; `/parse` and the
+seed also detect it) and it runs the two-phase lifecycle above. The simulated
+adapter produces a placeholder plan and a fake PR URL out of the box; the
+Omnigent adapter runs a real planning agent, then a real coding agent that opens
+a PR on `git@github.raw:compassx-platform/agent_boards`-style branches
+(`taskexec/{task_id[:8]}-{attempt}`).
+
 ## API (all under `/api/v1`)
 
 - `GET/POST /tasks`, `GET /tasks/{id}`, `GET /tasks/{id}/audit`
-- `POST /tasks/{id}/review` `{action: approve|retry|reject, note}` (status must be `needs_review`)
+- `POST /tasks/{id}/review` `{action: approve_plan|approve|retry|reject, note}` (status must be `needs_review`; `approve_plan` requires plan_status `awaiting_approval`)
 - `POST /tasks/{id}/unblock`
 - `GET /reviews` — tasks awaiting human sign-off
 - `POST /parse` — heuristic conversational task parsing (LLM plug-in point for Phase 3)
@@ -88,8 +114,13 @@ the simulated agent deliberately fails the first attempt.
 | Var                         | Default                 |
 | --------------------------- | ----------------------- |
 | `TASKEXEC_ADAPTER`          | `simulated`             |
-| `TASKEXEC_OMNIGENT_API_URL` | (Omnigent adapter)      |
+| `TASKEXEC_OMNIGENT_API_URL` | `http://…:6767`         |
 | `TASKEXEC_OMNIGENT_API_KEY` | (Omnigent adapter)      |
+| `TASKEXEC_OMNIGENT_HOST_ID` | (host running agents)   |
+| `TASKEXEC_OMNIGENT_WORKSPACE` | (frontend workspace)  |
+| `TASKEXEC_OMNIGENT_PLAN_AGENT_ID` | (planning agent)   |
+| `TASKEXEC_OMNIGENT_IMPLEMENT_AGENT_ID` | (coding agent)   |
+| `TASKEXEC_OMNIGENT_ROBOT_PR_URL` | `https://github.com/compassx-platform/agent_boards/pull/` |
 | `TASKEXEC_DATABASE_URL`     | `sqlite:////root/.taskexec/taskexec.db` |
 | `TASKEXEC_AGENT_CAPACITY`   | `5`                     |
 
@@ -112,6 +143,13 @@ The hook is already wired via `core.hooksPath` in this repo; it activates on
 
 ## Swapping the agent
 
-Implement `AgentAdapter` (`submit` / `poll` / `get_result` / `cancel`) in
-`backend/app/adapters/` and set `TASKEXEC_ADAPTER=<name>`.
-`backend/app/adapters/omnigent.py` is a ready skeleton for the real Omnigent API.
+Implement `AgentAdapter` (`submit(task, attempt, attempt_id, artifacts_dir, phase)` /
+`poll` / `get_result` / `cancel`) in `backend/app/adapters/` and set
+`TASKEXEC_ADAPTER=<name>`. `phase` is `"plan"`, `"implement"`, or `"execute"`;
+`run_status` (`running`/`failed`/`succeeded`) drives polling, and
+`ExecutionResult` carries `output`, optional `plan`, and optional `pr_url`.
+`backend/app/adapters/omnigent.py` is a complete implementation against the real
+Omnigent API (session create + user event + `items` harvest; plan/PR markers
+`<<<PLAN>>>…<<<END_PLAN>>>` and `pr_url:`). Note: the agent harness on the target
+host must be authenticated (CLI `/login`) or runs fail with
+`Not logged in · Please run /login`.

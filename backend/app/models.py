@@ -43,6 +43,13 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
+    # Implementation-plan lifecycle (plan-first execution).
+    # plan_status: none | planning | awaiting_approval | approved |
+    #              implementing | failed
+    plan_required: Mapped[bool] = mapped_column(default=False)
+    plan_status: Mapped[str] = mapped_column(String(32), default="none")
+    plan_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     criteria: Mapped[list["Criterion"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", order_by="Criterion.created_at"
     )
@@ -97,6 +104,8 @@ class Attempt(Base):
     task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), index=True)
     attempt_number: Mapped[int] = mapped_column()
     execution_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    phase: Mapped[str] = mapped_column(String(16), default="execute")  # plan | implement | execute
+    pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="running")
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)

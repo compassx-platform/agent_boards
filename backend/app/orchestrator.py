@@ -21,6 +21,14 @@ logger = logging.getLogger("taskexec.orchestrator")
 
 PRIORITY_RANK = {"low": 0, "normal": 1, "high": 2, "urgent": 3}
 
+PLAN_STATES = {
+    "none": "plan",
+    "planning": "plan",
+    "failed": "plan",
+    "approved": "implement",
+    "implementing": "implement",
+}
+
 
 class Orchestrator:
     """Background worker owning the task lifecycle.
@@ -28,13 +36,14 @@ class Orchestrator:
     Each tick:
       1. promote dependency-clear backlog tasks to queued
       2. start queued / due retry tasks (respecting agent capacity + backoff)
-      3. poll in-flight executions; on completion run verification and apply
-         risk gating rules to pick the next state.
+      3. poll in-flight executions; on completion run the phase handler
+         (plan-ready ⇒ human approval; implement/execute ⇒ verification +
+         risk gating).
     """
 
     def __init__(self) -> None:
         self.adapter = get_adapter(settings.adapter)
-        self._running: dict[str, str] = {}  # task_id -> execution_id
+        self._running: dict[str, dict] = {}  # task_id -> {execution_id, phase}
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -93,6 +102,13 @@ class Orchestrator:
 
     # -------------------------------------------------------------- start
 
+    def _phase_for(self, task: Task) -> str | None:
+        if not task.plan_required:
+            return "execute"
+        if task.plan_status == "awaiting_approval":
+            return None  # must not execute until a human approves the plan
+        return PLAN_STATES.get(task.plan_status, "plan")
+
     async def _start_available(self, db: Session, changed: set[str]) -> None:
         now = utcnow()
         candidates = (
@@ -106,7 +122,7 @@ class Orchestrator:
         for task in candidates:
             if started >= capacity:
                 break
-            if task.id in self._running:
+            if task.id in self._running or self._phase_for(task) is None:
                 continue
             if task.not_before and task.not_before > now:
                 continue
@@ -118,10 +134,17 @@ class Orchestrator:
             started += 1
 
     async def _start_attempt(self, db: Session, task: Task, changed: set[str]) -> bool:
+        phase = self._phase_for(task) or "execute"
+        if phase == "plan" and task.plan_status != "planning":
+            task.plan_status = "planning"
+        elif phase == "implement" and task.plan_status != "implementing":
+            task.plan_status = "implementing"
+
         artifacts_dir = settings.artifacts_dir / task.id / f"attempt-{task.current_attempt}"
         attempt = Attempt(
             task_id=task.id,
             attempt_number=task.current_attempt,
+            phase=phase,
             status="running",
             started_at=utcnow(),
             logs_ref=str(artifacts_dir),
@@ -130,17 +153,19 @@ class Orchestrator:
         db.commit()
         try:
             execution_id = await self.adapter.submit(
-                task, task.current_attempt, attempt.id, str(artifacts_dir)
+                task, task.current_attempt, attempt.id, str(artifacts_dir), phase
             )
         except Exception as exc:
             attempt.status = "failed"
             attempt.failure_reason = f"adapter submit failed: {exc}"
+            task.not_before = utcnow() + timedelta(seconds=min(2 ** (task.current_attempt + 1), 30))
+            transition(db, task, "queued", actor="orchestrator", reason=f"adapter submit failed, retry scheduled: {exc}")
             db.commit()
             logger.exception("adapter submit failed for task %s", task.id)
             return False
         attempt.execution_id = execution_id or attempt.id
         db.commit()
-        self._running[task.id] = attempt.execution_id
+        self._running[task.id] = {"execution_id": execution_id, "phase": phase}
         changed.add(task.id)
         return True
 
@@ -148,22 +173,22 @@ class Orchestrator:
 
     async def _poll_running(self, db: Session, changed: set[str]) -> None:
         for task_id in list(self._running.keys()):
-            execution_id = self._running[task_id]
-            status = await self.adapter.poll(execution_id)
+            entry = self._running[task_id]
+            status: ExecutionStatus = await self.adapter.poll(entry["execution_id"])
             if not status.running:
                 await self._finish_execution(db, task_id, changed)
 
     async def _finish_execution(self, db: Session, task_id: str, changed: set[str]) -> None:
-        execution_id = self._running.pop(task_id, None)
+        entry = self._running.pop(task_id, None)
         task = db.query(Task).filter(Task.id == task_id).first()
-        if not task or not execution_id:
+        if not task or not entry:
             return
         attempt = (
             db.query(Attempt)
-            .filter(Attempt.task_id == task_id, Attempt.execution_id == execution_id)
+            .filter(Attempt.task_id == task_id, Attempt.execution_id == entry["execution_id"])
             .first()
         )
-        result = await self.adapter.get_result(execution_id)
+        result = await self.adapter.get_result(entry["execution_id"])
         risk = RISK_RULES.get(task.risk_tier, RISK_RULES["low"])
         max_attempts = task.max_attempts or risk["max_attempts"]
         auto_approve = risk["auto_approve"]
@@ -172,13 +197,31 @@ class Orchestrator:
             attempt.status = "finished"
             attempt.finished_at = utcnow()
             attempt.agent_output = result.output
+            attempt.pr_url = result.pr_url or attempt.pr_url
             attempt.tools_used = json.dumps(result.tools_used)
             if result.logs_ref:
                 attempt.logs_ref = result.logs_ref
             if not result.success:
-                attempt.failure_reason = "agent reported failure"
+                attempt.failure_reason = result.output and result.output[:500] or "agent reported failure"
         db.commit()
 
+        # ---------------------------------------------------- plan phase done
+        if entry["phase"] == "plan":
+            if result.success:
+                task.plan_text = result.plan or result.output
+                task.plan_status = "awaiting_approval"
+                task.escalation_reason = "Implementation plan ready — awaiting approval"
+                transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
+                log_action(db, task, "plan_ready", actor="orchestrator", to_status="needs_review", reason="plan produced")
+            else:
+                task.plan_status = "failed"
+                reason = "planning failed: " + (attempt.failure_reason or "no plan produced")
+                await self._handle_failure(db, task, reason, max_attempts, changed)
+            changed.add(task.id)
+            await bus.publish({"type": "verification", "task_id": task.id, "verdict": "plan"})
+            return
+
+        # ------------------------------------------- implement / execute: verify
         transition(db, task, "verifying", actor="orchestrator", reason="agent output ready")
         db.flush()
 
@@ -191,7 +234,10 @@ class Orchestrator:
             attempt.failure_reason = verdict.failure_reason
         db.commit()
 
-        if verdict.verdict == "requires_review":
+        if not result.success:
+            reason = "agent execution failed: " + (attempt.failure_reason or "unknown error")
+            await self._handle_failure(db, task, reason, max_attempts, changed)
+        elif verdict.verdict == "requires_review":
             task.escalation_reason = verdict.failure_reason or "requires reviewer"
             transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
             log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
@@ -202,18 +248,12 @@ class Orchestrator:
                 log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
             else:
                 task.escalation_reason = None
+                if task.plan_required:
+                    task.plan_status = "done"
                 transition(db, task, "done", actor="orchestrator", reason="all criteria passed, auto-approved")
         else:
-            if task.current_attempt < max_attempts:
-                task.current_attempt += 1
-                task.not_before = utcnow() + timedelta(seconds=min(2 ** task.current_attempt, 30))
-                task.escalation_reason = None
-                transition(db, task, "executing", actor="orchestrator", reason=f"retry {task.current_attempt} scheduled")
-                log_action(db, task, "retry", actor="orchestrator", to_status="executing", reason=verdict.failure_reason or "verification failed")
-            else:
-                task.escalation_reason = verdict.failure_reason or "max attempts exhausted"
-                transition(db, task, "needs_review", actor="orchestrator", reason=f"max attempts ({max_attempts}) reached: {task.escalation_reason}")
-                log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
+            await self._handle_failure(db, task, verdict.failure_reason or "verification failed", max_attempts, changed)
+
         changed.add(task.id)
         await bus.publish(
             {
@@ -222,6 +262,19 @@ class Orchestrator:
                 "verdict": verdict.verdict,
             }
         )
+
+    async def _handle_failure(self, db: Session, task: Task, reason: str, max_attempts: int, changed: set[str]) -> None:
+        if task.current_attempt < max_attempts:
+            task.current_attempt += 1
+            task.not_before = utcnow() + timedelta(seconds=min(2 ** task.current_attempt, 30))
+            task.escalation_reason = None
+            transition(db, task, "executing", actor="orchestrator", reason=f"retry {task.current_attempt} scheduled")
+            log_action(db, task, "retry", actor="orchestrator", to_status="executing", reason=reason)
+        else:
+            task.escalation_reason = reason
+            transition(db, task, "needs_review", actor="orchestrator", reason=f"max attempts ({max_attempts}) reached: {reason}")
+            log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=reason)
+        changed.add(task.id)
 
     # -------------------------------------------------------------- recovery
 
@@ -244,18 +297,40 @@ class Orchestrator:
 
     async def review_retry(self, db: Session, task: Task, note: str = "", actor: str = "reviewer") -> None:
         """Move a needs_review task back into the queue with reviewer context."""
+        if task.plan_required and task.plan_status in {"awaiting_approval", "failed"}:
+            task.plan_status = "planning"
+            reason = f"reviewer requested a new plan: {note}".strip()
+        else:
+            reason = f"reviewer requested retry: {note}".strip()
         task.current_attempt += 1
         task.not_before = None
         task.escalation_reason = None
-        transition(db, task, "executing", actor=actor, reason=f"reviewer requested retry: {note}".strip())
+        transition(db, task, "executing", actor=actor, reason=reason)
         log_action(db, task, "review", actor=actor, to_status="executing", reason=note or "reviewer retry")
         db.commit()
         await bus.publish(task_event(task, db))
 
     async def review_approve(self, db: Session, task: Task, note: str = "", actor: str = "reviewer") -> None:
+        if task.plan_required and task.plan_status == "planning":
+            raise ValueError("planning failed — approve_plan unavailable; re-plan or reject instead")
         task.escalation_reason = None
+        if task.plan_required:
+            task.plan_status = "done"
         transition(db, task, "done", actor=actor, reason=f"reviewer approved: {note}".strip())
         log_action(db, task, "review", actor=actor, to_status="done", reason=note or "approved")
+        db.commit()
+        await bus.publish(task_event(task, db))
+
+    async def review_approve_plan(self, db: Session, task: Task, note: str = "", actor: str = "reviewer") -> None:
+        """Approve a produced plan: the implementation phase starts immediately."""
+        if task.plan_status not in {"awaiting_approval", "failed"}:
+            raise ValueError(f"no pending plan to approve (plan_status={task.plan_status!r})")
+        task.plan_status = "approved"
+        task.current_attempt = 0  # reset attempt budget for the implement phase
+        task.not_before = None
+        task.escalation_reason = None
+        transition(db, task, "queued", actor=actor, reason=f"plan approved, implementation queued: {note}".strip())
+        log_action(db, task, "plan_approved", actor=actor, to_status="queued", reason=note or "plan approved")
         db.commit()
         await bus.publish(task_event(task, db))
 

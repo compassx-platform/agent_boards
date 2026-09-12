@@ -25,13 +25,20 @@ class SimulatedAgent(AgentAdapter):
     name = "simulated"
 
     def __init__(self) -> None:
-        self._runs: dict[str, tuple[str, float, bool, str, str]] = {}
+        self._runs: dict[str, tuple[str, float, bool, str, str, str]] = {}
         self._seq = 0
 
     def supports_capability(self, capability: str) -> bool:
         return capability in {"default", "sim", "research", "build"}
 
-    async def submit(self, task: Task, attempt_number: int, attempt_id: str, artifacts_dir: str) -> str:
+    async def submit(
+        self,
+        task: Task,
+        attempt_number: int,
+        attempt_id: str,
+        artifacts_dir: str,
+        phase: str = "execute",
+    ) -> str:
         self._seq += 1
         execution_id = f"sim-{int(time.time())}-{self._seq}"
         duration = random.uniform(settings.simulator_min_seconds, settings.simulator_max_seconds)
@@ -39,18 +46,20 @@ class SimulatedAgent(AgentAdapter):
             task.priority, 0.0
         )
         duration = max(0.6, duration + priority_bonus)
-        fail_once = "fail_once" in (task.intent or "")
-        fail = fail_once and attempt_number == 0
+        fail = "fail_once" in (task.intent or "") and attempt_number == 0
         artifact_dir = Path(artifacts_dir)
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        self._runs[execution_id] = (attempt_id, time.monotonic() + duration, fail, task.title, str(artifact_dir))
+        self._runs[execution_id] = (
+            attempt_id, time.monotonic() + duration, fail, task.title,
+            str(artifact_dir), phase,
+        )
         return execution_id
 
     async def poll(self, execution_id: str) -> ExecutionStatus:
         entry = self._runs.get(execution_id)
         if not entry:
             return ExecutionStatus(running=False, state="finished", detail="unknown execution_id")
-        _, finish_at, _, _, _ = entry
+        _, finish_at, _, _, _, _ = entry
         if time.monotonic() >= finish_at:
             return ExecutionStatus(running=False, state="finished", detail="output ready")
         return ExecutionStatus(running=True, state="running", detail="working…")
@@ -59,29 +68,48 @@ class SimulatedAgent(AgentAdapter):
         entry = self._runs.pop(execution_id, None)
         if not entry:
             return ExecutionResult(success=False, output="missing execution")
-        attempt_id, _, fail, title, artifact_dir = entry
+        attempt_id, _, fail, title, artifacts_dir, phase = entry
         settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        output = (
+        base = (
             f"[sim:{execution_id}] task '{title}'\n"
-            f"intent: {title}\n"
-            f"attempt: {attempt_id}\n"
+            f"phase: {phase}\n"
         )
+        plan = ""
+        pr_url = ""
         if fail:
-            output += "result: FAILED (simulated failure – run again)\n"
+            output = base + "result: FAILED (simulated failure – run again)\n"
+        elif phase == "plan":
+            plan = (
+                f"# Implementation plan\n\n"
+                f"1. Read the task context and definition-of-done.\n"
+                f"2. Implement the change in a git worktree branch.\n"
+                f"3. Run the verification criteria, then open a pull request.\n"
+                f"\nTarget branch: taskexec/{title[:40].lower().replace(' ', '-')}\n"
+            )
+            output = base + "result: success\nplan: ready\n" + plan
         else:
-            output += "result: success\nsummary: completed\n"
+            branch = f"taskexec/{title[:32].lower().replace(' ', '-')}"
+            pr_url = f"{settings.robot_pr_url}{8000 + (hash(execution_id) % 9000):06d}"
+            output = (
+                base
+                + f"result: success\nsummary: completed\n"
+                + f"branch: {branch}\n"
+                + f"pr_url: {pr_url}\n"
+            )
 
-        artifact_path = Path(artifact_dir) / "artifact.txt"
+        Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
+        artifact_path = Path(artifacts_dir) / "artifact.txt"
         artifact_path.write_text(output)
 
-        run_log = Path(artifact_dir) / "run.log"
+        run_log = Path(artifacts_dir) / "run.log"
         run_log.write_text(
             json.dumps(
                 {
                     "execution_id": execution_id,
+                    "phase": phase,
                     "artifact": str(artifact_path),
-                    "tools": ["read_context", "write_artifact"],
+                    "tools": ["read_context", "write_artifact", "open_pull_request"],
                 },
                 indent=2,
             )
@@ -89,6 +117,8 @@ class SimulatedAgent(AgentAdapter):
 
         return ExecutionResult(
             output=output,
+            plan=plan,
+            pr_url=pr_url,
             tools_used=["read_context", "reason", "write_artifact"],
             logs_ref=str(run_log),
             success=not fail,

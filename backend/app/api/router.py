@@ -47,6 +47,7 @@ class TaskCreate(BaseModel):
     risk_tier: str = "low"
     agent_capability: str = "default"
     max_attempts: int | None = None
+    plan_required: bool = False
     context: list[ContextRefIn] = []
     criteria: list[CriterionIn] = []
     depends_on: list[str] = []
@@ -71,7 +72,7 @@ class ParseRequest(BaseModel):
 
 
 class ReviewRequest(BaseModel):
-    action: Literal["approve", "retry", "reject"]
+    action: Literal["approve", "retry", "reject", "approve_plan"]
     note: str = ""
 
 
@@ -100,6 +101,8 @@ def _build_task(db: Session, payload: TaskCreate, user: str) -> Task:
         created_by=user,
         max_attempts=payload.max_attempts or risk["max_attempts"],
         status="backlog",
+        plan_required=payload.plan_required,
+        plan_status="none",
     )
     db.add(task)
     db.flush()
@@ -222,7 +225,12 @@ async def review_task(
     user = _current_user(request)
     try:
         if payload.action == "approve":
-            await orchestrator.review_approve(db, task, payload.note, user)
+            if task.plan_status == "awaiting_approval":
+                await orchestrator.review_approve_plan(db, task, payload.note, user)
+            else:
+                await orchestrator.review_approve(db, task, payload.note, user)
+        elif payload.action == "approve_plan":
+            await orchestrator.review_approve_plan(db, task, payload.note, user)
         elif payload.action == "retry":
             await orchestrator.review_retry(db, task, payload.note, user)
         else:
@@ -311,6 +319,8 @@ def parse_intent(payload: ParseRequest) -> dict:
             }
         )
 
+    plan_required = any(k in lowered for k in ["plan first", "plan it", "plan then", "approach proposes", "propose an approach", "plan required", "with a plan"])
+
     return {
         "parsed": {
             "title": title,
@@ -318,6 +328,7 @@ def parse_intent(payload: ParseRequest) -> dict:
             "priority": priority,
             "risk_tier": risk_tier,
             "agent_capability": "default",
+            "plan_required": plan_required,
             "criteria": criteria,
         },
         "confidence": 0.6,
@@ -361,6 +372,16 @@ async def stream_events() -> StreamingResponse:
 @router.post("/demo/seed")
 def seed_demo(db: Session = Depends(get_session)) -> dict:
     samples = [
+        {
+            "title": "Add plaid support to the checkout flow",
+            "intent": "Integrate plaid into checkout so users can pay from a connected bank account. Plan first, then implement in a branch and open a PR.",
+            "priority": "high",
+            "risk_tier": "medium",
+            "plan_required": True,
+            "context": [
+                {"type": "link", "ref": "https://github.com/compassx-platform/agent_boards", "description": "repo"},
+            ],
+        },
         {
             "title": "Write release notes for v0.2",
             "intent": "Draft release notes summarizing the new board and review features.",

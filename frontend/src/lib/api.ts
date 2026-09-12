@@ -10,6 +10,14 @@ export type Status =
 
 export type Priority = 'low' | 'normal' | 'high' | 'urgent'
 export type RiskTier = 'low' | 'medium' | 'high'
+export type PlanStatus =
+  | 'none'
+  | 'planning'
+  | 'awaiting_approval'
+  | 'approved'
+  | 'implementing'
+  | 'done'
+  | 'failed'
 export type CheckType =
   | 'automated_test'
   | 'schema_check'
@@ -37,6 +45,8 @@ export interface Attempt {
   id: string
   attempt_number: number
   execution_id: string | null
+  phase: string
+  pr_url: string | null
   status: string
   started_at: string | null
   finished_at: string | null
@@ -70,6 +80,10 @@ export interface Task {
   current_attempt: number
   max_attempts: number
   escalation_reason: string | null
+  plan_required: boolean
+  plan_status: PlanStatus
+  plan_text: string | null
+  pr_url: string | null
   depends_on: string[]
   created_at: string
   updated_at: string
@@ -93,6 +107,7 @@ export interface TaskCreateInput {
   risk_tier: RiskTier
   agent_capability: string
   max_attempts?: number
+  plan_required?: boolean
   context?: { type: string; ref: string; description?: string }[]
   criteria: { description: string; check_type: CheckType; check_config: Record<string, unknown> }[]
   depends_on?: string[]
@@ -125,7 +140,7 @@ export const api = {
   audit: (id: string) => http<Audit[]>(`/tasks/${id}/audit`),
   createTask: (input: TaskCreateInput) =>
     http<Task>('/tasks', { method: 'POST', body: JSON.stringify(input) }),
-  review: (id: string, action: 'approve' | 'retry' | 'reject', note: string) =>
+  review: (id: string, action: 'approve' | 'retry' | 'reject' | 'approve_plan', note: string) =>
     http<Task>(`/tasks/${id}/review`, {
       method: 'POST',
       body: JSON.stringify({ action, note }),
@@ -177,6 +192,16 @@ export const BOARD_COLUMNS: Status[] = [
   'rejected',
   'blocked',
 ]
+
+export const PLAN_STATUS_META: Record<PlanStatus, { label: string; color: string }> = {
+  none: { label: 'no plan', color: '#8e8e93' },
+  planning: { label: 'planning', color: '#0a84ff' },
+  awaiting_approval: { label: 'plan awaiting approval', color: '#ff9f0a' },
+  approved: { label: 'plan approved', color: '#30d158' },
+  implementing: { label: 'implementing', color: '#bf5af2' },
+  done: { label: 'plan done', color: '#30d158' },
+  failed: { label: 'plan failed', color: '#ff453a' },
+}
 
 export function timeAgo(iso: string | null): string {
   if (!iso) return ''

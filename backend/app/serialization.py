@@ -45,6 +45,8 @@ def attempt_out(a: Attempt) -> dict:
         "id": a.id,
         "attempt_number": a.attempt_number,
         "execution_id": a.execution_id,
+        "phase": a.phase,
+        "pr_url": a.pr_url,
         "status": a.status,
         "started_at": _dt(a.started_at),
         "finished_at": _dt(a.finished_at),
@@ -59,6 +61,7 @@ def attempt_out(a: Attempt) -> dict:
 
 def serialize_task(db: Session, task: Task) -> dict:
     deps = [d.id for d in task.deps(db)]
+    latest_pr = next((a.pr_url for a in reversed(task.attempts) if a.pr_url), None)
     return {
         "id": task.id,
         "title": task.title,
@@ -71,6 +74,10 @@ def serialize_task(db: Session, task: Task) -> dict:
         "current_attempt": task.current_attempt,
         "max_attempts": task.max_attempts,
         "escalation_reason": task.escalation_reason,
+        "plan_required": task.plan_required,
+        "plan_status": task.plan_status,
+        "plan_text": task.plan_text,
+        "pr_url": latest_pr,
         "depends_on": deps,
         "created_at": _dt(task.created_at),
         "updated_at": _dt(task.updated_at),

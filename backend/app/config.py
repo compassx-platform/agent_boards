@@ -49,10 +49,22 @@ class Settings(BaseSettings):
     poll_interval_seconds: float = 1.0
     max_execution_seconds: int = 600
 
+    # Adapter: "simulated" (deterministic, local demo) or "omnigent" (real
+    # Omnigent server sessions). The lifecycle is identical either way: a
+    # plan_required task goes backlog → executing(plan) → needs_review(plan
+    # approval) → executing(implement) → verifying → done/needs_review.
     adapter: str = "simulated"
-    omnigent_api_url: str = "https://api.omnigent.example.com"
+    omnigent_api_url: str = "http://compassx-omnigent-server.compassx.svc.cluster.local:6767"
     omnigent_api_key: str = ""
+    # Session binding: this host + repo dir the Omnigent agent runs in.
+    omnigent_host_id: str = "97e1d6b0299b58a7b4b8a7f1eeafaaf1"
+    omnigent_workspace: str = "/workspaces/app-59f99ff8a7854a50/ws_945bbda579d44d4d"
+    omnigent_branch_prefix: str = "taskexec"
+    # Per-phase agent mapping (ids from GET /v1/agents on the server).
+    omnigent_plan_agent_id: str = "eac9e787e68ae6774d77e618031c287a"  # debby
+    omnigent_implement_agent_id: str = "faa173dc95dad9c41a2c36b8fcbb9ce2"  # jcode
 
+    robot_pr_url: str = "https://github.com/compassx-platform/agent_boards/pull/"
     simulator_min_seconds: float = 1.5
     simulator_max_seconds: float = 4.0
 

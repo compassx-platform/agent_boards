@@ -7,7 +7,7 @@ import type {
   Priority,
   RiskTier,
 } from './lib/api'
-import { BOARD_COLUMNS, STATUS_META, readStream, timeAgo, api } from './lib/api'
+import { BOARD_COLUMNS, PLAN_STATUS_META, STATUS_META, readStream, timeAgo, api } from './lib/api'
 import './App.css'
 
 // ------------------------------------------------------------------------- data
@@ -180,6 +180,7 @@ function NewTaskForm({
   const [priority, setPriority] = useState<Priority>('normal')
   const [risk, setRisk] = useState<RiskTier>('low')
   const [capability, setCapability] = useState('default')
+  const [planRequired, setPlanRequired] = useState(false)
   const [deps, setDeps] = useState<string[]>([])
   const [criteria, setCriteria] = useState<CriterionDraft[]>([
     { description: 'Agent output indicates success', check_type: 'output_match', check_config: '{"pattern": "success"}' },
@@ -196,6 +197,7 @@ function NewTaskForm({
     if (p.priority) setPriority(p.priority)
     if (p.risk_tier) setRisk(p.risk_tier)
     if (p.agent_capability) setCapability(p.agent_capability)
+    if (p.plan_required !== undefined) setPlanRequired(p.plan_required)
     if (p.criteria && p.criteria.length) {
       setCriteria(
         p.criteria.map((c) => ({
@@ -232,6 +234,7 @@ function NewTaskForm({
         priority,
         risk_tier: risk,
         agent_capability: capability,
+        plan_required: planRequired,
         depends_on: deps,
         context: context.filter((c) => c.ref.trim()),
         criteria: criteria.filter((c) => c.description.trim()).map((c) => {
@@ -313,6 +316,13 @@ function NewTaskForm({
               ))}
             </select>
           </div>
+        </div>
+
+        <div className="field plan-toggle">
+          <label>
+            <input type="checkbox" checked={planRequired} onChange={(e) => setPlanRequired(e.target.checked)} />
+            Require an implementation plan (agent plans first → you approve → agent implements → PR)
+          </label>
         </div>
 
         <div className="field">
@@ -428,7 +438,7 @@ function Reviews({
     }
   }, [])
 
-  async function act(id: string, action: 'approve' | 'retry' | 'reject') {
+  async function act(id: string, action: 'approve' | 'retry' | 'reject' | 'approve_plan') {
     setBusy(id)
     setError(null)
     try {
@@ -456,32 +466,58 @@ function Reviews({
                 <strong>{t.title}</strong>
               </button>
               <Chip className={RISK_CLASS[t.risk_tier]}>risk: {t.risk_tier}</Chip>
+              {t.plan_required && <Chip className="r-medium">plan-first</Chip>}
               <Chip className="r-high">attempt {t.current_attempt}/{t.max_attempts}</Chip>
             </div>
             {t.escalation_reason && <p className="reason">⏫ {t.escalation_reason}</p>}
-            <div className="criteria-list">
-              {t.criteria.map((c) => (
-                <div className="criterion-line" key={c.id}>
-                  <span className={`v-${c.result ?? 'pending'}`}>{c.result ?? 'pending'}</span>
-                  <span>{c.description}</span>
-                </div>
-              ))}
-            </div>
+
+            {t.plan_status === 'awaiting_approval' ? (
+              <div className="plan-block">
+                <h4>Proposed implementation plan</h4>
+                <pre className="plan-text">{t.plan_text ?? '(plan produced, open task for details)'}</pre>
+              </div>
+            ) : (
+              <div className="criteria-list">
+                {t.criteria.map((c) => (
+                  <div className="criterion-line" key={c.id}>
+                    <span className={`v-${c.result ?? 'pending'}`}>{c.result ?? 'pending'}</span>
+                    <span>{c.description}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="row">
               <input
                 value={notes[t.id] ?? ''}
                 onChange={(e) => setNotes({ ...notes, [t.id]: e.target.value })}
-                placeholder="Reviewer note"
+                placeholder={t.plan_status === 'awaiting_approval' ? 'Note to the agent (optional)' : 'Reviewer note'}
               />
-              <button className="ok" disabled={busy === t.id} onClick={() => act(t.id, 'approve')}>
-                Approve
-              </button>
-              <button disabled={busy === t.id} onClick={() => act(t.id, 'retry')}>
-                Retry
-              </button>
-              <button disabled={busy === t.id} onClick={() => act(t.id, 'reject')}>
-                Reject
-              </button>
+              {t.plan_status === 'awaiting_approval' ? (
+                <>
+                  <button className="ok" disabled={busy === t.id} onClick={() => act(t.id, 'approve_plan')}>
+                    Approve plan → implement
+                  </button>
+                  <button disabled={busy === t.id} onClick={() => act(t.id, 'retry')}>
+                    Re-plan
+                  </button>
+                  <button disabled={busy === t.id} onClick={() => act(t.id, 'reject')}>
+                    Reject
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button className="ok" disabled={busy === t.id} onClick={() => act(t.id, 'approve')}>
+                    Approve
+                  </button>
+                  <button disabled={busy === t.id} onClick={() => act(t.id, 'retry')}>
+                    Retry
+                  </button>
+                  <button disabled={busy === t.id} onClick={() => act(t.id, 'reject')}>
+                    Reject
+                  </button>
+                </>
+              )}
             </div>
           </section>
         ))
@@ -534,12 +570,12 @@ function TaskDetail({
     load()
   }, [load])
 
-  async function act(action: 'approve' | 'retry' | 'reject' | 'unblock') {
+  async function act(action: 'approve' | 'retry' | 'reject' | 'unblock' | 'approve_plan') {
     setBusy(true)
     setError(null)
     try {
       if (action === 'unblock') await api.unblock(id)
-      else await api.review(id, action as 'approve' | 'retry' | 'reject', note)
+      else await api.review(id, action as 'approve' | 'retry' | 'reject' | 'approve_plan', note)
       await load()
       await refresh()
     } catch (e) {
@@ -553,6 +589,8 @@ function TaskDetail({
 
   const meta = STATUS_META[task.status]
   const needsReview = task.status === 'needs_review'
+  const planPending = task.plan_status === 'awaiting_approval'
+  const planMeta = PLAN_STATUS_META[task.plan_status] ?? PLAN_STATUS_META.none
 
   return (
     <div className="overlay">
@@ -577,6 +615,32 @@ function TaskDetail({
               {task.escalation_reason && <Chip className="r-high">⏫ escalated</Chip>}
             </div>
             {task.escalation_reason && <p className="reason">Reason: {task.escalation_reason}</p>}
+
+            {task.plan_required && (
+              <section className="plan-detail">
+                <h3>
+                  Implementation plan{' '}
+                  <Chip style={{ color: planMeta.color }}>{planMeta.label}</Chip>
+                </h3>
+                {task.plan_text ? (
+                  <pre className="plan-text">{task.plan_text}</pre>
+                ) : (
+                  <p className="muted">
+                    {task.plan_status === 'none'
+                      ? 'No plan yet — the agent will produce one before any code changes.'
+                      : 'The agent is working on a plan…'}
+                  </p>
+                )}
+                {task.pr_url && (
+                  <p>
+                    <a href={task.pr_url} target="_blank" rel="noreferrer">
+                      🔗 Pull request: {task.pr_url}
+                    </a>
+                  </p>
+                )}
+              </section>
+            )}
+
             <h3>Intent</h3>
             <p>{task.intent}</p>
 
@@ -613,10 +677,18 @@ function TaskDetail({
                 <div className="attempt-head">
                   <strong>Attempt {a.attempt_number + 1}</strong>
                   <Chip>{a.status}</Chip>
+                  {a.phase && a.phase !== 'execute' && <Chip className="r-medium">{a.phase}</Chip>}
                   <Chip>verify: {a.verification_result ?? '—'}</Chip>
                   <span className="muted">{timeAgo(a.finished_at ?? a.started_at)}</span>
                 </div>
                 {a.failure_reason && <p className="reason">failure: {a.failure_reason}</p>}
+                {a.pr_url && (
+                  <p>
+                    <a href={a.pr_url} target="_blank" rel="noreferrer">
+                      🔗 PR: {a.pr_url}
+                    </a>
+                  </p>
+                )}
                 <details>
                   <summary>agent output</summary>
                   <pre className="output">{a.agent_output}</pre>
@@ -637,15 +709,28 @@ function TaskDetail({
 
           {needsReview && (
             <section className="panel review-panel">
-              <h3>Reviewer action</h3>
+              <h3>{planPending ? 'Plan review' : 'Reviewer action'}</h3>
               <div className="row">
                 <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional)" />
-                <button className="ok" disabled={busy} onClick={() => act('approve')}>
-                  Approve
-                </button>
-                <button disabled={busy} onClick={() => act('retry')}>
-                  Retry with note
-                </button>
+                {planPending ? (
+                  <>
+                    <button className="ok" disabled={busy} onClick={() => act('approve_plan')}>
+                      Approve plan → implement
+                    </button>
+                    <button disabled={busy} onClick={() => act('retry')}>
+                      Re-plan
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className="ok" disabled={busy} onClick={() => act('approve')}>
+                      Approve
+                    </button>
+                    <button disabled={busy} onClick={() => act('retry')}>
+                      Retry with note
+                    </button>
+                  </>
+                )}
                 <button disabled={busy} onClick={() => act('reject')}>
                   Reject
                 </button>
