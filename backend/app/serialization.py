@@ -71,6 +71,7 @@ def serialize_task(db: Session, task: Task) -> dict:
         "status": task.status,
         "created_by": task.created_by,
         "agent_capability": task.agent_capability,
+        "workspace": task.workspace,
         "current_attempt": task.current_attempt,
         "max_attempts": task.max_attempts,
         "escalation_reason": task.escalation_reason,

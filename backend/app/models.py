@@ -36,6 +36,9 @@ class Task(Base):
     status: Mapped[str] = mapped_column(String(32), default="backlog", index=True)
     created_by: Mapped[str] = mapped_column(String(128), default="creator@example.com")
     agent_capability: Mapped[str] = mapped_column(String(128), default="default")
+    # Optional per-task workspace override: the host directory of the app/repo
+    # the agent should work in. Falls back to settings.omnigent_workspace.
+    workspace: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_attempt: Mapped[int] = mapped_column(default=0)
     max_attempts: Mapped[int] = mapped_column(default=3)
     escalation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

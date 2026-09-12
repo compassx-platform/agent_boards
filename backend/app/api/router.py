@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -48,6 +49,7 @@ class TaskCreate(BaseModel):
     agent_capability: str = "default"
     max_attempts: int | None = None
     plan_required: bool = False
+    workspace: str | None = None
     context: list[ContextRefIn] = []
     criteria: list[CriterionIn] = []
     depends_on: list[str] = []
@@ -103,6 +105,7 @@ def _build_task(db: Session, payload: TaskCreate, user: str) -> Task:
         status="backlog",
         plan_required=payload.plan_required,
         plan_status="none",
+        workspace=(payload.workspace or "").strip() or None,
     )
     db.add(task)
     db.flush()
@@ -321,6 +324,15 @@ def parse_intent(payload: ParseRequest) -> dict:
 
     plan_required = any(k in lowered for k in ["plan first", "plan it", "plan then", "approach proposes", "propose an approach", "plan required", "with a plan"])
 
+    ws = None
+    m = re.search(r"(?:workspace|repo)\s*[:=]\s*(\S+)", text, re.IGNORECASE)
+    if m:
+        ws = m.group(1).strip("`\"'")
+    else:
+        m = re.search(r"\b(?:in|from|under)\s+(/[^\s,;.]+)", text)
+        if m:
+            ws = m.group(1)
+
     return {
         "parsed": {
             "title": title,
@@ -329,6 +341,7 @@ def parse_intent(payload: ParseRequest) -> dict:
             "risk_tier": risk_tier,
             "agent_capability": "default",
             "plan_required": plan_required,
+            "workspace": ws,
             "criteria": criteria,
         },
         "confidence": 0.6,
@@ -378,6 +391,7 @@ def seed_demo(db: Session = Depends(get_session)) -> dict:
             "priority": "high",
             "risk_tier": "medium",
             "plan_required": True,
+            "workspace": "/workspaces/app-59f99ff8a7854a50/ws_945bbda579d44d4d",
             "context": [
                 {"type": "link", "ref": "https://github.com/compassx-platform/agent_boards", "description": "repo"},
             ],

@@ -77,6 +77,7 @@ export interface Task {
   status: Status
   created_by: string
   agent_capability: string
+  workspace: string | null
   current_attempt: number
   max_attempts: number
   escalation_reason: string | null
@@ -108,6 +109,7 @@ export interface TaskCreateInput {
   agent_capability: string
   max_attempts?: number
   plan_required?: boolean
+  workspace?: string
   context?: { type: string; ref: string; description?: string }[]
   criteria: { description: string; check_type: CheckType; check_config: Record<string, unknown> }[]
   depends_on?: string[]

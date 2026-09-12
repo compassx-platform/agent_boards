@@ -181,6 +181,7 @@ function NewTaskForm({
   const [risk, setRisk] = useState<RiskTier>('low')
   const [capability, setCapability] = useState('default')
   const [planRequired, setPlanRequired] = useState(false)
+  const [workspace, setWorkspace] = useState('')
   const [deps, setDeps] = useState<string[]>([])
   const [criteria, setCriteria] = useState<CriterionDraft[]>([
     { description: 'Agent output indicates success', check_type: 'output_match', check_config: '{"pattern": "success"}' },
@@ -198,6 +199,7 @@ function NewTaskForm({
     if (p.risk_tier) setRisk(p.risk_tier)
     if (p.agent_capability) setCapability(p.agent_capability)
     if (p.plan_required !== undefined) setPlanRequired(p.plan_required)
+    if (p.workspace) setWorkspace(p.workspace)
     if (p.criteria && p.criteria.length) {
       setCriteria(
         p.criteria.map((c) => ({
@@ -235,6 +237,7 @@ function NewTaskForm({
         risk_tier: risk,
         agent_capability: capability,
         plan_required: planRequired,
+        workspace: workspace.trim() || undefined,
         depends_on: deps,
         context: context.filter((c) => c.ref.trim()),
         criteria: criteria.filter((c) => c.description.trim()).map((c) => {
@@ -323,6 +326,15 @@ function NewTaskForm({
             <input type="checkbox" checked={planRequired} onChange={(e) => setPlanRequired(e.target.checked)} />
             Require an implementation plan (agent plans first → you approve → agent implements → PR)
           </label>
+        </div>
+
+        <div className="field">
+          <label>Workspace (host path to the app/repo; blank = default)</label>
+          <input
+            placeholder="/workspaces/.../frontend — e.g. the app you want changed"
+            value={workspace}
+            onChange={(e) => setWorkspace(e.target.value)}
+          />
         </div>
 
         <div className="field">
@@ -599,7 +611,8 @@ function TaskDetail({
           <div>
             <h2>{task.title}</h2>
             <p className="muted">
-              {task.id.slice(0, 8)} · {task.priority} · risk {task.risk_tier} · {task.agent_capability} · created {timeAgo(task.created_at)} by {task.created_by}
+              {task.id.slice(0, 8)} · {task.priority} · risk {task.risk_tier} · {task.agent_capability} · workspace{' '}
+              <code>{task.workspace ?? 'default'}</code> · created {timeAgo(task.created_at)} by {task.created_by}
             </p>
           </div>
           <button className="ghost" onClick={onClose}>

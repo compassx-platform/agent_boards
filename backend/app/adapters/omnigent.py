@@ -60,12 +60,16 @@ class OmnigentAgent(AgentAdapter):
             return settings.omnigent_implement_agent_id
         return settings.omnigent_implement_agent_id
 
+    def _workspace_for(self, task: Task) -> str:
+        return (task.workspace or "").strip() or settings.omnigent_workspace
+
     def _headers(self) -> dict[str, str]:
         if settings.omnigent_api_key:
             return {"Authorization": f"Bearer {settings.omnigent_api_key}"}
         return {}
 
     def _prompt_for(self, task: Task, phase: str, attempt_number: int) -> str:
+        ws = self._workspace_for(task)
         criteria = "\n".join(
             f"- [{c.check_type}] {c.description}"
             + (f"  config: {c.check_config}" if c.check_config not in ("{}", "") else "")
@@ -78,7 +82,7 @@ class OmnigentAgent(AgentAdapter):
                 f"INTENT:\n{task.intent}\n\n"
                 f"DEFINITION OF DONE (verification criteria):\n{criteria}\n\n"
                 f"CONTEXT:\n{context or '(none)'}\n"
-                f"PRIORITY: {task.priority}  RISK TIER: {task.risk_tier}  WORKSPACE: {settings.omnigent_workspace}\n\n"
+                f"PRIORITY: {task.priority}  RISK TIER: {task.risk_tier}  WORKSPACE: {ws}\n\n"
                 "Produce a concise, actionable implementation plan. Do NOT change "
                 "any files yet. Wrap the plan between exactly these two markers:\n"
                 f"{_PLAN_OPEN}\n<your plan>\n{_PLAN_CLOSE}\n"
@@ -91,7 +95,8 @@ class OmnigentAgent(AgentAdapter):
         )
         return (
             f"You are the implementation agent for TaskExec task '{task.title}' "
-            f"on host workspace {settings.omnigent_workspace}.\n\n"
+            f"on host workspace {ws} (the source repository the worktree is "
+            f"branched from).\n\n"
             f"INTENT:\n{task.intent}\n\n"
             f"~~ APPROVED PLAN ~~\n{plan}\n"
             f"~~ END APPROVED PLAN ~~\n\n"
@@ -152,7 +157,7 @@ class OmnigentAgent(AgentAdapter):
             "agent_id": agent_id,
             "title": f"[{phase}] {task.title} (task {task.id[:8]})",
             "host_id": settings.omnigent_host_id,
-            "workspace": settings.omnigent_workspace,
+            "workspace": self._workspace_for(task),
         }
         if phase == "implement":
             body["git"] = {

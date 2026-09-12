@@ -25,7 +25,7 @@ class SimulatedAgent(AgentAdapter):
     name = "simulated"
 
     def __init__(self) -> None:
-        self._runs: dict[str, tuple[str, float, bool, str, str, str]] = {}
+        self._runs: dict[str, tuple[str, float, bool, str, str, str, str]] = {}
         self._seq = 0
 
     def supports_capability(self, capability: str) -> bool:
@@ -47,11 +47,12 @@ class SimulatedAgent(AgentAdapter):
         )
         duration = max(0.6, duration + priority_bonus)
         fail = "fail_once" in (task.intent or "") and attempt_number == 0
+        ws = (task.workspace or "").strip() or settings.omnigent_workspace
         artifact_dir = Path(artifacts_dir)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         self._runs[execution_id] = (
             attempt_id, time.monotonic() + duration, fail, task.title,
-            str(artifact_dir), phase,
+            str(artifact_dir), phase, ws,
         )
         return execution_id
 
@@ -59,7 +60,7 @@ class SimulatedAgent(AgentAdapter):
         entry = self._runs.get(execution_id)
         if not entry:
             return ExecutionStatus(running=False, state="finished", detail="unknown execution_id")
-        _, finish_at, _, _, _, _ = entry
+        _, finish_at, _, _, _, _, _ = entry
         if time.monotonic() >= finish_at:
             return ExecutionStatus(running=False, state="finished", detail="output ready")
         return ExecutionStatus(running=True, state="running", detail="working…")
@@ -68,12 +69,13 @@ class SimulatedAgent(AgentAdapter):
         entry = self._runs.pop(execution_id, None)
         if not entry:
             return ExecutionResult(success=False, output="missing execution")
-        attempt_id, _, fail, title, artifacts_dir, phase = entry
+        attempt_id, _, fail, title, artifacts_dir, phase, ws = entry
         settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         base = (
             f"[sim:{execution_id}] task '{title}'\n"
             f"phase: {phase}\n"
+            f"workspace: {ws}\n"
         )
         plan = ""
         pr_url = ""
