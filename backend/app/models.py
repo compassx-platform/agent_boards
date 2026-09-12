@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db import Base
+
+
+def utcnow() -> datetime:
+    # naive-UTC everywhere: SQLite strips tzinfo, so keep one convention.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def new_id() -> str:
+    return str(uuid4())
+
+
+class TaskDependency(Base):
+    __tablename__ = "task_dependencies"
+
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), primary_key=True)
+    dependency_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), primary_key=True)
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(255))
+    intent: Mapped[str] = mapped_column(Text)
+    priority: Mapped[str] = mapped_column(String(16), default="normal")
+    risk_tier: Mapped[str] = mapped_column(String(16), default="low")
+    status: Mapped[str] = mapped_column(String(32), default="backlog", index=True)
+    created_by: Mapped[str] = mapped_column(String(128), default="creator@example.com")
+    agent_capability: Mapped[str] = mapped_column(String(128), default="default")
+    current_attempt: Mapped[int] = mapped_column(default=0)
+    max_attempts: Mapped[int] = mapped_column(default=3)
+    escalation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    not_before: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    criteria: Mapped[list["Criterion"]] = relationship(
+        back_populates="task", cascade="all, delete-orphan", order_by="Criterion.created_at"
+    )
+    context: Mapped[list["ContextRef"]] = relationship(
+        back_populates="task", cascade="all, delete-orphan", order_by="ContextRef.created_at"
+    )
+    attempts: Mapped[list["Attempt"]] = relationship(
+        back_populates="task", cascade="all, delete-orphan", order_by="Attempt.attempt_number"
+    )
+    audits: Mapped[list["AuditLog"]] = relationship(
+        back_populates="task", cascade="all, delete-orphan", order_by="AuditLog.ts"
+    )
+
+    def deps(self, db) -> list[Task]:
+        rows = db.query(TaskDependency).filter(TaskDependency.task_id == self.id).all()
+        ids = [r.dependency_id for r in rows]
+        return db.query(Task).filter(Task.id.in_(ids)).all() if ids else []
+
+
+class Criterion(Base):
+    __tablename__ = "criteria"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), index=True)
+    description: Mapped[str] = mapped_column(Text)
+    check_type: Mapped[str] = mapped_column(String(32))
+    check_config: Mapped[str] = mapped_column(Text, default="{}")
+    result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    task: Mapped[Task] = relationship(back_populates="criteria")
+
+
+class ContextRef(Base):
+    __tablename__ = "context_refs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), index=True)
+    type: Mapped[str] = mapped_column(String(32))
+    ref: Mapped[str] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    task: Mapped[Task] = relationship(back_populates="context")
+
+
+class Attempt(Base):
+    __tablename__ = "attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), index=True)
+    attempt_number: Mapped[int] = mapped_column()
+    execution_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    agent_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verification_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    verification_details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tools_used: Mapped[str] = mapped_column(Text, default="[]")
+    logs_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    task: Mapped[Task] = relationship(back_populates="attempts")
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), index=True)
+    ts: Mapped[datetime] = mapped_column(default=utcnow)
+    actor: Mapped[str] = mapped_column(String(128), default="system")
+    action: Mapped[str] = mapped_column(String(64))
+    from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    task: Mapped[Task] = relationship(back_populates="audits")
