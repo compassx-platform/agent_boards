@@ -29,9 +29,10 @@ class HostProvisioner:
       3. Reuse an already-active sandbox only when it already references the
          target workspace; otherwise dev/start attaches the workspace to the
          pod. Poll dev/status every ~2s until host_online: true.
-      4. Verify the returned host_id is actually online on the Omnigent server
-         (GET /v1/hosts) before returning — execution never starts on a host
-         that Omnigent has not seen.
+      4. Verify the dev host is actually online on the Omnigent server
+         (GET /v1/hosts). Omnigent registers the pod under a host_id that
+         differs from CompassX's, so the match is by app NAME (== host name);
+         execution never starts on a host that Omnigent has not seen.
 
     The caller persists the returned {host_id, host_name, workspace,
     workspace_id, workspace_name, dev_url} back onto the task row.
@@ -65,8 +66,8 @@ class HostProvisioner:
             return {"Authorization": f"Bearer {settings.omnigent_api_key}"}
         return {}
 
-    async def omnigent_host(self, host_id: str) -> dict | None:
-        """Return the host record from the Omnigent server, or None."""
+    async def _omnigent_hosts(self) -> list[dict]:
+        """Fetch the host list from the Omnigent server."""
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
@@ -75,34 +76,52 @@ class HostProvisioner:
                 )
             if resp.status_code >= 400:
                 logger.warning("omnigent /v1/hosts failed: %s", resp.status_code)
-                return None
+                return []
             data = resp.json()
-            hosts = data.get("hosts", []) if isinstance(data, dict) else []
-            for h in hosts:
-                if h.get("host_id") == host_id:
-                    return h
-            return None
+            return data.get("hosts", []) if isinstance(data, dict) else []
         except Exception as exc:  # noqa: BLE001
             logger.warning("omnigent /v1/hosts unreachable: %s", exc)
-            return None
+            return []
 
-    async def verify_omnigent_host(self, host_id: str, host_name: str = "") -> bool:
-        """Confirm the host is registered and online with the Omnigent server."""
-        record = await self.omnigent_host(host_id)
+    async def omnigent_host(self, host_id: str, host_name: str = "") -> dict | None:
+        """Return the Omnigent host record for a CompassX dev host.
+
+        The Omnigent host_id for a dev pod differs from the id CompassX reports,
+        so the host is matched by NAME (which equals the app name); the
+        CompassX host_id is only used as a last-resort exact match.
+        """
+        hosts = await self._omnigent_hosts()
+        name = (host_name or "").strip().lower()
+        if name:
+            for h in hosts:
+                if str(h.get("name") or "").strip().lower() == name:
+                    return h
+        for h in hosts:
+            if h.get("host_id") == host_id:
+                return h
+        return None
+
+    async def verify_omnigent_host(self, host_id: str, host_name: str = "") -> dict | None:
+        """Confirm the host is registered & online with Omnigent.
+
+        Returns the online Omnigent host record (its host_id may differ from the
+        CompassX-reported one) or None when absent / not online.
+        """
+        record = await self.omnigent_host(host_id, host_name)
         if not record:
             logger.error(
                 "host %s (%s) not found on the Omnigent server — refusing to execute",
                 host_id, host_name,
             )
-            return False
+            return None
         status = str(record.get("status") or "").lower()
         if status != "online":
             logger.error(
                 "host %s (%s) is %r on the Omnigent server, not online",
-                host_id, host_name, status,
+                record.get("host_id"), host_name, status,
             )
-            return False
-        return True
+            return None
+        return record
 
     # ------------------------------------------------------------- compassx
 
@@ -212,12 +231,19 @@ class HostProvisioner:
         if not host_id:
             raise CompassXError(f"dev host for app {app_id} returned no host_id")
 
-        # 4) Verify the host is visible & online on the Omnigent server.
-        if not await self.verify_omnigent_host(host_id, str(status.get("host_name") or "")):
+        # 4) Verify the host is visible & online on the Omnigent server. The
+        #    Omnigent host_id differs from CompassX's, so the match is by app
+        #    name; use the OMNIGENT host_id/name for the rest of the flow.
+        host_record = await self.verify_omnigent_host(
+            host_id, str(status.get("host_name") or "")
+        )
+        if not host_record:
             raise CompassXError(
                 f"host {host_id} not online on the Omnigent server — "
                 f"rejecting execution for app {app_id}"
             )
+        host_id = str(host_record.get("host_id") or host_id)
+        host_name = str(host_record.get("name") or status.get("host_name") or "")
 
         # Workspace folder on the dev host. Prefer the contract's
         # workspace_folder (== app-{app_id}/{workspace_name}); fall back to the
@@ -233,7 +259,7 @@ class HostProvisioner:
 
         return {
             "host_id": host_id,
-            "host_name": str(status.get("host_name") or ""),
+            "host_name": host_name,
             "workspace_id": str(status.get("workspace_id") or workspace_id or ""),
             "workspace_name": str(status.get("workspace_name") or workspace_name or ""),
             "workspace": workspace,

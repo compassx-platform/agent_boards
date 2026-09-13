@@ -293,6 +293,9 @@ def unblock_task(task_id: str, request: Request, db: Session = Depends(get_sessi
         raise HTTPException(status_code=404, detail="task not found")
     if task.status != "blocked":
         raise HTTPException(status_code=409, detail="task is not blocked")
+    task.current_attempt = 0
+    task.not_before = None
+    task.escalation_reason = None
     transition(db, task, "queued", actor=_current_user(request), reason="manually unblocked")
     db.commit()
     return serialize_task(db, task)

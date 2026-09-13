@@ -169,8 +169,21 @@ class Orchestrator:
         except Exception as exc:
             attempt.status = "failed"
             attempt.failure_reason = f"adapter submit failed: {exc}"
-            task.not_before = utcnow() + timedelta(seconds=min(2 ** (task.current_attempt + 1), 30))
-            transition(db, task, "queued", actor="orchestrator", reason=f"adapter submit failed, retry scheduled: {exc}")
+            risk = RISK_RULES.get(task.risk_tier, RISK_RULES["low"])
+            max_attempts = task.max_attempts or risk["max_attempts"]
+            task.current_attempt += 1
+            if task.current_attempt >= max_attempts:
+                reason = f"max attempts ({task.current_attempt}/{max_attempts}) reached: {exc}"
+                task.escalation_reason = reason
+                transition(db, task, "blocked", actor="orchestrator", reason=reason)
+                log_action(db, task, "blocked", actor="orchestrator", to_status="blocked", reason=str(exc))
+            else:
+                task.not_before = utcnow() + timedelta(seconds=min(2 ** (task.current_attempt + 1), 30))
+                transition(
+                    db, task, "queued", actor="orchestrator",
+                    reason=f"adapter submit failed (attempt {task.current_attempt}/{max_attempts}), retry scheduled: {exc}",
+                )
+                log_action(db, task, "retry", actor="orchestrator", to_status="queued", reason=str(exc))
             db.commit()
             logger.exception("adapter submit failed for task %s", task.id)
             return False
@@ -345,8 +358,8 @@ class Orchestrator:
             log_action(db, task, "retry", actor="orchestrator", to_status="executing", reason=reason)
         else:
             task.escalation_reason = reason
-            transition(db, task, "needs_review", actor="orchestrator", reason=f"max attempts ({max_attempts}) reached: {reason}")
-            log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=reason)
+            transition(db, task, "blocked", actor="orchestrator", reason=f"max attempts ({task.current_attempt}/{max_attempts}) reached: {reason}")
+            log_action(db, task, "blocked", actor="orchestrator", to_status="blocked", reason=reason)
         changed.add(task.id)
 
     async def _publish_changes(self, db: Session, task: Task, actor: str = "orchestrator") -> bool:
