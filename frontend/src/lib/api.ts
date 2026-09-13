@@ -89,6 +89,13 @@ export interface Task {
   agent_capability: string
   harness: string
   workspace: string | null
+  compassx_app_id: string | null
+  compassx_app_name: string | null
+  compassx_workspace_id: string | null
+  compassx_published: boolean
+  host_id: string | null
+  host_name: string | null
+  dev_url: string | null
   current_attempt: number
   max_attempts: number
   escalation_reason: string | null
@@ -126,6 +133,9 @@ export interface TaskCreateInput {
   plan_required?: boolean
   workspace?: string
   harness?: string
+  compassx_app_id?: string
+  compassx_app_name?: string
+  compassx_workspace_id?: string
   context?: { type: string; ref: string; description?: string }[]
   criteria: { description: string; check_type: CheckType; check_config: Record<string, unknown> }[]
   depends_on?: string[]
@@ -141,6 +151,45 @@ export interface HarnessesResponse {
   default: string
   adapter: string
   source: string
+}
+
+export interface CompassXApp {
+  id: string
+  name: string
+  slug: string
+  description: string | null
+  app_type: string
+  status: string
+  route: string | null
+  git_repo_url: string | null
+  git_branch: string | null
+  created_at: string | null
+}
+
+export interface CompassXWorkspace {
+  id: string
+  name: string
+  folder_path: string
+  git_branch: string | null
+  status: string
+  created_at: string | null
+  last_active_at: string | null
+}
+
+export interface CompassXAppsResponse {
+  apps: CompassXApp[]
+  error: string | null
+  configured: boolean
+}
+
+export interface CompassXWorkspacesResponse {
+  workspaces: CompassXWorkspace[]
+  error: string | null
+}
+
+export interface CompassXDevStatusResponse {
+  dev: Record<string, unknown>
+  error?: string | null
 }
 
 export const DEFAULT_HARNESS = 'opencode-native'
@@ -188,6 +237,11 @@ export const api = {
   capabilities: () =>
     http<{ name: string; adapter: string }[]>('/capabilities'),
   harnesses: () => http<HarnessesResponse>('/harnesses'),
+  compassxApps: () => http<CompassXAppsResponse>('/compassx/apps'),
+  compassxWorkspaces: (appId: string) =>
+    http<CompassXWorkspacesResponse>(`/compassx/apps/${appId}/dev/workspaces`),
+  compassxDevStatus: (appId: string) =>
+    http<CompassXDevStatusResponse>(`/compassx/apps/${appId}/dev/status`),
   parse: (text: string) =>
     http<{ parsed: Partial<TaskCreateInput>; confidence: number; note: string }>('/parse', {
       method: 'POST',

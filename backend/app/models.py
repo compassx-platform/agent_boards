@@ -42,6 +42,19 @@ class Task(Base):
     # Optional per-task workspace override: the host directory of the app/repo
     # the agent should work in. Falls back to settings.omnigent_workspace.
     workspace: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # CompassX platform binding: the app this task runs against. When set, the
+    # orchestrator spins up (or resumes) the app's remote dev host at execution
+    # time and runs the agent session on that host instead of the local one.
+    compassx_app_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    compassx_app_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Workspace created/resumed by CompassX dev/start (persisted for redo).
+    compassx_workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Whether the completed changes were committed/pushed to git via dev/publish.
+    compassx_published: Mapped[bool] = mapped_column(default=False)
+    # Dev sandbox the task executed on (set by the provisioner at submit time).
+    host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    dev_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_attempt: Mapped[int] = mapped_column(default=0)
     max_attempts: Mapped[int] = mapped_column(default=3)
     escalation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

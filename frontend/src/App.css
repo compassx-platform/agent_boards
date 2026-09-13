@@ -119,6 +119,11 @@ textarea:focus {
   border-color: rgba(191, 90, 242, 0.45);
   background: rgba(191, 90, 242, 0.08);
 }
+.app-chip {
+  color: #30d158;
+  border-color: rgba(48, 209, 88, 0.45);
+  background: rgba(48, 209, 88, 0.08);
+}
 .topbar nav {
   display: flex;
   gap: 4px;
@@ -238,6 +243,32 @@ textarea:focus {
 }
 .plan-detail a {
   color: var(--accent);
+}
+.compassx-block .meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin: 8px 0;
+}
+.compassx-block .meta-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.warn {
+  color: var(--warn);
 }
 .empty {
   color: var(--text-dim);

@@ -72,6 +72,18 @@ class Settings(BaseSettings):
 
     omnigent_api_url: str = "http://compassx-omnigent-server.compassx.svc.cluster.local:6767"
     omnigent_api_key: str = ""
+
+    # CompassX platform integration. Execution of a task bound to a CompassX
+    # app first spins up a remote dev host via these endpoints ("dev/start"),
+    # waits for it to come online, verifies it is registered with the Omnigent
+    # server, and only then runs the task's agent session on that host.
+    compassx_api_url: str = "http://135.13.180.167/api/v1"
+    compassx_api_token: str = ""
+    compassx_workspace_id: str = ""
+    compassx_workspace_slug: str = "default"
+    # Host bring-up polling when dev/start returns host_online: false.
+    host_start_poll_interval_seconds: float = 2.0
+    host_start_max_wait_seconds: float = 30.0
     # Session binding: this host + repo dir the Omnigent agent runs in.
     omnigent_host_id: str = "97e1d6b0299b58a7b4b8a7f1eeafaaf1"
     omnigent_workspace: str = "/workspaces/app-59f99ff8a7854a50/ws_945bbda579d44d4d"

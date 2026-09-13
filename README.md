@@ -56,6 +56,8 @@ backend/
     ├── events.py           # in-process pub/sub → SSE
     ├── orchestrator.py     # background worker: queue, attempts, verification, gating
     ├── verification.py     # automated_test / schema_check / output_match / human checks
+    ├── compassx.py         # CompassX platform client: apps, dev sandboxes, publish
+    ├── provisioning.py     # spin up/resume remote dev host + verify it on Omnigent
     ├── adapters/
     │   ├── __init__.py     # AgentAdapter interface + factory (ExecutionResult: output/plan/pr_url)
     │   ├── simulated.py    # local deterministic agent (dev, phase-aware: plan → PR)
@@ -88,6 +90,30 @@ npx vite --host 0.0.0.0 --port 8080 --cors
 A demo set of tasks is seeded automatically on first start (`POST /api/v1/demo/seed`
 to add more). To see the auto-retry path, put `(fail_once)` in a task's intent —
 the simulated agent deliberately fails the first attempt.
+
+## CompassX remote dev hosts
+
+To make execution scalable the platform can run agent sessions on **remote dev
+hosts** managed by the CompassX platform instead of the local Omnigent host.
+
+* A task is optionally bound to a **CompassX app** (`compassx_app_id`, picked
+  from `GET /compassx/apps` in the create-task form). The app, its repo, and
+  existing dev workspaces come from the CompassX API.
+* When a bound task **starts execution** the orchestrator:
+  1. checks `GET /api/v1/apps/{app_id}/dev/status` (reuse if already healthy),
+  2. else `POST /api/v1/apps/{app_id}/dev/start` (resumes `compassx_workspace_id`
+     when set, otherwise a fresh workspace is cloned),
+  3. polls `dev/status` every ~2s until `host_online: true`, then
+  4. **verifies the host is online on the Omnigent server** (`GET /v1/hosts`)
+     and only then submits the agent session on that `host_id`.
+* On successful completion (`done` — auto-approved or human-approved) the
+  completed changes are committed & pushed to git via
+  `POST /api/v1/apps/{app_id}/dev/publish`, tracked by `compassx_published`.
+
+Set `TASKEXEC_COMPASSX_API_TOKEN` (and optionally `TASKEXEC_COMPASSX_API_URL`,
+`TASKEXEC_COMPASSX_WORKSPACE_ID`, `TASKEXEC_COMPASSX_WORKSPACE_SLUG`) to enable
+the flow. Without a token, bound tasks fail gracefully with a retry backoff and
+unbound tasks keep running on the local host exactly as before.
 
 ## Plaid checkout
 
@@ -127,6 +153,10 @@ a PR on `git@github.raw:compassx-platform/agent_boards`-style branches
 - `GET /metrics`, `GET /capabilities`
 - `GET /stream` — SSE live board events
 - `POST /demo/seed`
+- `GET /compassx/apps` — CompassX apps for the task picker
+- `GET /compassx/apps/{app_id}/dev/workspaces` — existing dev workspaces
+- `GET /compassx/apps/{app_id}/dev/status` — sandbox/host health
+- `POST /compassx/apps/{app_id}/dev/stop` — stop the sandbox to free compute
 
 ## Configuration (env)
 
@@ -140,6 +170,12 @@ a PR on `git@github.raw:compassx-platform/agent_boards`-style branches
 | `TASKEXEC_OMNIGENT_PLAN_AGENT_ID` | (planning agent)   |
 | `TASKEXEC_OMNIGENT_IMPLEMENT_AGENT_ID` | (coding agent)   |
 | `TASKEXEC_OMNIGENT_ROBOT_PR_URL` | `https://github.com/compassx-platform/agent_boards/pull/` |
+| `TASKEXEC_COMPASSX_API_URL` | `http://135.13.180.167/api/v1` |
+| `TASKEXEC_COMPASSX_API_TOKEN` | (CompassX Bearer token; unset ⇒ no remote hosts) |
+| `TASKEXEC_COMPASSX_WORKSPACE_ID` | (workspace scoping header, optional) |
+| `TASKEXEC_COMPASSX_WORKSPACE_SLUG` | `default` |
+| `TASKEXEC_HOST_START_POLL_INTERVAL_SECONDS` | `2.0` |
+| `TASKEXEC_HOST_START_MAX_WAIT_SECONDS` | `30.0` |
 | `TASKEXEC_DATABASE_URL`     | `sqlite:////root/.taskexec/taskexec.db` |
 | `TASKEXEC_AGENT_CAPACITY`   | `5`                     |
 

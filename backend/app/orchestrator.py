@@ -13,6 +13,7 @@ from app.config import RISK_RULES, settings
 from app.db import SessionLocal
 from app.events import bus
 from app.models import Attempt, ExecutionSession, Task
+from app.provisioning import provisioner
 from app.serialization import task_event
 from app.state_machine import transition, utcnow
 from app.verification import verify_attempt
@@ -138,6 +139,28 @@ class Orchestrator:
         db.add(attempt)
         db.commit()
         try:
+            if (task.compassx_app_id or "").strip():
+                host = await provisioner.ensure_host(task)
+                task.host_id = host.get("host_id") or task.host_id
+                task.host_name = host.get("host_name") or task.host_name
+                task.compassx_workspace_id = host.get("workspace_id") or task.compassx_workspace_id
+                if host.get("workspace"):
+                    task.workspace = host["workspace"]
+                if host.get("dev_url"):
+                    task.dev_url = host["dev_url"]
+                db.commit()
+                log_action(
+                    db,
+                    task,
+                    "host_provisioned",
+                    actor="orchestrator",
+                    to_status=task.status,
+                    reason=(
+                        f"dev host {task.host_id} ({task.host_name or '?'}) ready on "
+                        f"Omnigent; workspace {task.workspace}"
+                    ),
+                )
+                db.commit()
             execution_id = await self.adapter.submit(
                 task, task.current_attempt, attempt.id, str(artifacts_dir), phase
             )
@@ -298,6 +321,7 @@ class Orchestrator:
                 if task.plan_required:
                     task.plan_status = "done"
                 transition(db, task, "done", actor="orchestrator", reason="all criteria passed, auto-approved")
+                await self._publish_changes(db, task)
         else:
             await self._handle_failure(db, task, verdict.failure_reason or "verification failed", max_attempts, changed)
 
@@ -322,6 +346,36 @@ class Orchestrator:
             transition(db, task, "needs_review", actor="orchestrator", reason=f"max attempts ({max_attempts}) reached: {reason}")
             log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=reason)
         changed.add(task.id)
+
+    async def _publish_changes(self, db: Session, task: Task, actor: str = "orchestrator") -> bool:
+        """Commit & push a CompassX-bound task's completed changes to git."""
+        if not (task.compassx_app_id or "").strip():
+            return False
+        if task.compassx_published:
+            return False
+        try:
+            commit_message = (
+                f"{task.title}\n\nTask {task.id}\n"
+                f"Intent: {(task.intent or '')[:200]}"
+            )
+            result = await provisioner.publish(task, commit_message, actor=actor)
+            task.compassx_published = True
+            sha = str((result or {}).get("commit_sha") or "")
+            log_action(
+                db,
+                task,
+                "published",
+                actor=actor,
+                to_status=task.status,
+                reason=f"changes committed & pushed to git" + (f" ({sha})" if sha else ""),
+            )
+            db.commit()
+            await bus.publish(task_event(task, db))
+            logger.info("published task %s changes via CompassX (sha=%s)", task.id, sha)
+            return True
+        except Exception as exc:  # noqa: BLE001 — publish is best-effort post-completion
+            logger.warning("dev/publish failed for task %s: %s", task.id, exc)
+            return False
 
     # -------------------------------------------------------------- recovery
 
@@ -366,6 +420,7 @@ class Orchestrator:
         transition(db, task, "done", actor=actor, reason=f"reviewer approved: {note}".strip())
         log_action(db, task, "review", actor=actor, to_status="done", reason=note or "approved")
         db.commit()
+        await self._publish_changes(db, task, actor=actor)
         await bus.publish(task_event(task, db))
 
     async def review_approve_plan(self, db: Session, task: Task, note: str = "", actor: str = "reviewer") -> None:

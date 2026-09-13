@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.adapters import get_adapter
 from app.audit import log_action
+from app.compassx import compassx
 from app.config import CHECK_TYPES, PRIORITIES, RISK_RULES, RISK_TIERS, settings
 from app.db import get_session
 from app.events import bus
@@ -52,6 +53,9 @@ class TaskCreate(BaseModel):
     plan_required: bool = False
     workspace: str | None = None
     harness: str | None = None
+    compassx_app_id: str | None = None
+    compassx_app_name: str | None = None
+    compassx_workspace_id: str | None = None
     context: list[ContextRefIn] = []
     criteria: list[CriterionIn] = []
     depends_on: list[str] = []
@@ -113,6 +117,9 @@ def _build_task(db: Session, payload: TaskCreate, user: str) -> Task:
         plan_status="none",
         workspace=(payload.workspace or "").strip() or None,
         harness=(payload.harness or "").strip() or settings.omnigent_default_harness,
+        compassx_app_id=(payload.compassx_app_id or "").strip() or None,
+        compassx_app_name=(payload.compassx_app_name or "").strip() or None,
+        compassx_workspace_id=(payload.compassx_workspace_id or "").strip() or None,
     )
     db.add(task)
     db.flush()
@@ -356,6 +363,51 @@ async def harnesses() -> dict:
     }
 
 
+@router.get("/compassx/apps")
+async def compassx_apps() -> dict:
+    """CompassX applications (populates the per-task app picker).
+
+    Execution of a task bound to one of these apps spins up the app's remote
+    dev host first, verifies it is online on the Omnigent server, then runs the
+    agent session on that host.
+    """
+    try:
+        apps = await compassx.list_apps()
+    except Exception as exc:  # noqa: BLE001 - surface reachability to the UI
+        return {"apps": [], "error": str(exc), "configured": bool(settings.compassx_api_token)}
+    return {"apps": apps, "error": None, "configured": bool(settings.compassx_api_token)}
+
+
+@router.get("/compassx/apps/{app_id}/dev/workspaces")
+async def compassx_dev_workspaces(app_id: str) -> dict:
+    """Existing dev workspaces for an app (used to resume work instead of a fresh clone)."""
+    try:
+        workspaces = await compassx.list_dev_workspaces(app_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"workspaces": [], "error": str(exc)}
+    return {"workspaces": workspaces, "error": None}
+
+
+@router.get("/compassx/apps/{app_id}/dev/status")
+async def compassx_dev_status(app_id: str) -> dict:
+    """Health of the app's dev sandbox + Omnigent host connection."""
+    try:
+        status = await compassx.dev_status(app_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    return {"dev": status}
+
+
+@router.post("/compassx/apps/{app_id}/dev/stop")
+async def compassx_dev_stop(app_id: str) -> dict:
+    """Stop the app's dev sandbox (frees cluster compute)."""
+    try:
+        result = await compassx.dev_stop(app_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    return {"dev": result}
+
+
 @router.post("/parse")
 def parse_intent(payload: ParseRequest) -> dict:
     """Conversational task creation (heuristic stand-in — wire an LLM here for Phase 3)."""
@@ -420,6 +472,11 @@ def parse_intent(payload: ParseRequest) -> dict:
     if m:
         harness = m.group(1).strip().lower()
 
+    compassx_app_id = None
+    m = re.search(r"\bapp\s*[:=]\s*(app_[A-Za-z0-9_-]+)", text, re.IGNORECASE)
+    if m:
+        compassx_app_id = m.group(1).strip()
+
     return {
         "parsed": {
             "title": title,
@@ -430,6 +487,7 @@ def parse_intent(payload: ParseRequest) -> dict:
             "plan_required": plan_required,
             "workspace": ws,
             "harness": harness,
+            "compassx_app_id": compassx_app_id,
             "criteria": criteria,
         },
         "confidence": 0.6,
@@ -472,6 +530,7 @@ async def stream_events() -> StreamingResponse:
 
 @router.post("/demo/seed")
 def seed_demo(db: Session = Depends(get_session)) -> dict:
+    apps_enabled = bool((settings.compassx_api_token or "").strip())
     samples = [
         {
             "title": "Add plaid support to the checkout flow",
@@ -483,6 +542,14 @@ def seed_demo(db: Session = Depends(get_session)) -> dict:
             "context": [
                 {"type": "link", "ref": "https://github.com/compassx-platform/agent_boards", "description": "repo"},
             ],
+        },
+        {
+            "title": "Bump checkout UI copy for v0.3",
+            "intent": "Update the checkout page copy and empty-state text on the Agent Boards app deployed in the CompassX dev sandbox.",
+            "priority": "normal",
+            "risk_tier": "low",
+            "compassx_app_id": "app_59f99ff8a7854a50" if apps_enabled else None,
+            "compassx_app_name": "Agent Boards" if apps_enabled else None,
         },
         {
             "title": "Write release notes for v0.2",

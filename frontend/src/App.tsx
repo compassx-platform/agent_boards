@@ -7,6 +7,8 @@ import type {
   Priority,
   RiskTier,
   HarnessesResponse,
+  CompassXApp,
+  CompassXWorkspace,
 } from './lib/api'
 import { BOARD_COLUMNS, DEFAULT_HARNESS, PLAN_STATUS_META, STATUS_META, readStream, timeAgo, api } from './lib/api'
 import Checkout from './components/Checkout'
@@ -107,6 +109,8 @@ function TaskCard({ task, onClick }: { task: Task; onClick: (id: string) => void
         <Chip className={PRIORITY_CLASS[task.priority]}>{task.priority}</Chip>
         <Chip className={RISK_CLASS[task.risk_tier]}>{task.risk_tier}</Chip>
         <Chip className="harness-chip" title="omnigent harness">{task.harness || DEFAULT_HARNESS}</Chip>
+        {task.compassx_app_name && <Chip className="app-chip" title="CompassX app">{task.compassx_app_name}</Chip>}
+        {task.host_name && <Chip title="execution host">{task.host_name}</Chip>}
         <Chip>attempt {task.current_attempt + (task.status === 'executing' || task.status === 'verifying' ? 1 : 0)}/{task.max_attempts}</Chip>
         {task.escalation_reason && <Chip className="r-high">escalated</Chip>}
         {task.session_id && <Chip title="agent session">⚡ {task.session_id}</Chip>}
@@ -208,6 +212,40 @@ function NewTaskForm({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // CompassX app binding: pick the app the task runs against; a remote dev
+  // host for that app is spun up (or resumed) automatically at execution time.
+  const [apps, setApps] = useState<CompassXApp[]>([])
+  const [appsError, setAppsError] = useState<string | null>(null)
+  const [appId, setAppId] = useState('')
+  const [reuseWorkspace, setReuseWorkspace] = useState(false)
+  const [appWorkspaces, setAppWorkspaces] = useState<CompassXWorkspace[]>([])
+  const [appWsId, setAppWsId] = useState('')
+
+  const loadApps = useCallback(async () => {
+    try {
+      const res = await api.compassxApps()
+      setApps(res.apps ?? [])
+      setAppsError(res.error ? String(res.error).slice(0, 120) : null)
+    } catch (e) {
+      setAppsError(String(e))
+    }
+  }, [])
+
+  useEffect(() => {
+    loadApps()
+  }, [loadApps])
+
+  useEffect(() => {
+    setAppWsId('')
+    setAppWorkspaces([])
+    if (appId && reuseWorkspace) {
+      api
+        .compassxWorkspaces(appId)
+        .then((res) => setAppWorkspaces(res.workspaces ?? []))
+        .catch((e) => setAppsError(String(e)))
+    }
+  }, [appId, reuseWorkspace])
+
   function applyParsed(p: Partial<TaskCreateInput>) {
     setTitle(p.title ?? '')
     setIntent(p.intent ?? '')
@@ -217,6 +255,7 @@ function NewTaskForm({
     if (p.harness) setHarness(p.harness)
     if (p.plan_required !== undefined) setPlanRequired(p.plan_required)
     if (p.workspace) setWorkspace(p.workspace)
+    if (p.compassx_app_id) setAppId(p.compassx_app_id)
     if (p.criteria && p.criteria.length) {
       setCriteria(
         p.criteria.map((c) => ({
@@ -256,6 +295,9 @@ function NewTaskForm({
         harness,
         plan_required: planRequired,
         workspace: workspace.trim() || undefined,
+        compassx_app_id: appId || undefined,
+        compassx_app_name: appId ? apps.find((a) => a.id === appId)?.name : undefined,
+        compassx_workspace_id: appId && reuseWorkspace && appWsId ? appWsId : undefined,
         depends_on: deps,
         context: context.filter((c) => c.ref.trim()),
         criteria: criteria.filter((c) => c.description.trim()).map((c) => {
@@ -352,6 +394,44 @@ function NewTaskForm({
               Resolved to its current agent on the Omnigent server at execution time.
             </p>
           </div>
+        </div>
+
+        <div className="field">
+          <label>CompassX app (remote dev host is spun up at execution)</label>
+          <select value={appId} onChange={(e) => setAppId(e.target.value)}>
+            <option value="">— none (run on the local default host) —</option>
+            {apps.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name} {a.git_branch ? `(${a.git_branch})` : ''}
+              </option>
+            ))}
+          </select>
+          {appsError && <p className="muted warn">{appsError}</p>}
+          {apps.length === 0 && !appsError && appId === '' && (
+            <p className="muted">CompassX not configured on the backend — apps cannot be listed.</p>
+          )}
+          {appId !== '' && (
+            <div className="row">
+              <label className="checkbox-label">
+                <input type="checkbox" checked={reuseWorkspace} onChange={(e) => setReuseWorkspace(e.target.checked)} />
+                Reuse an existing dev workspace (redo task)
+              </label>
+              {reuseWorkspace && (
+                <select value={appWsId} onChange={(e) => setAppWsId(e.target.value)}>
+                  <option value="">— create a fresh workspace —</option>
+                  {appWorkspaces.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.name || w.id} ({w.folder_path})
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
+          <p className="muted">
+            Bound tasks start a Kubernetes dev pod for the app, verify the host is online in the
+            Omnigent server, then run the agent there.
+          </p>
         </div>
 
         <div className="field plan-toggle">
@@ -673,6 +753,38 @@ function TaskDetail({
                     open
                   </a>
                 ) : null}
+              </div>
+            )}
+
+            {task.compassx_app_id && (
+              <div className="compassx-block">
+                <h3>CompassX dev environment</h3>
+                <div className="meta-grid">
+                  <div>
+                    <span className="muted">app</span>
+                    <strong>{task.compassx_app_name ?? task.compassx_app_id}</strong>
+                  </div>
+                  <div>
+                    <span className="muted">host</span>
+                    <strong>{task.host_name ?? 'not provisioned yet'}</strong>
+                    {task.host_id && <code> · {task.host_id.slice(0, 12)}…</code>}
+                  </div>
+                  <div>
+                    <span className="muted">workspace</span>
+                    <code>{task.workspace ?? 'new workspace on start'}</code>
+                  </div>
+                  <div>
+                    <span className="muted">publish</span>
+                    <strong>{task.compassx_published ? '✓ committed & pushed' : 'pending completion'}</strong>
+                  </div>
+                </div>
+                {task.dev_url && (
+                  <p>
+                    <a href={task.dev_url} target="_blank" rel="noreferrer">
+                      🔗 Open dev environment
+                    </a>
+                  </p>
+                )}
               </div>
             )}
 

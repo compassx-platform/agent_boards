@@ -15,8 +15,8 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_columns()
     Base.metadata.create_all(bind=engine)
+    ensure_columns()
     if settings.seed_on_startup:
         db = SessionLocal()
         from app.models import Task

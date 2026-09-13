@@ -35,3 +35,6 @@ dist/
 
 # Node (belt-and-suspenders; frontend/.gitignore is authoritative)
 node_modules/
+
+# Agent scratch/test artifacts
+mtime-test-*/

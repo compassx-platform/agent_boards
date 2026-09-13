@@ -39,14 +39,24 @@ def get_session():
 
 
 def ensure_columns() -> None:
-    """Idempotent dev migration: add columns that don't exist yet (SQLite)."""
+    """Idempotent dev migration: add missing columns to the tasks table (SQLite)."""
     if not _is_sqlite:
         return
     from sqlalchemy import inspect, text
 
-    cols = {c["name"] for c in inspect(engine).get_columns("tasks")}
-    if "harness" not in cols:
+    existing = {c["name"] for c in inspect(engine).get_columns("tasks")}
+    additions = {
+        "harness": "harness VARCHAR(64) DEFAULT 'opencode-native'",
+        "compassx_app_id": "compassx_app_id VARCHAR(64)",
+        "compassx_app_name": "compassx_app_name VARCHAR(255)",
+        "compassx_workspace_id": "compassx_workspace_id VARCHAR(64)",
+        "compassx_published": "compassx_published BOOLEAN DEFAULT 0",
+        "host_id": "host_id VARCHAR(64)",
+        "host_name": "host_name VARCHAR(255)",
+        "dev_url": "dev_url TEXT",
+    }
+    missing = [stmt for name, stmt in additions.items() if name not in existing]
+    if missing:
         with engine.begin() as conn:
-            conn.execute(
-                text("ALTER TABLE tasks ADD COLUMN harness VARCHAR(64) DEFAULT 'opencode-native'")
-            )
+            for stmt in missing:
+                conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {stmt}"))

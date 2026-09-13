@@ -199,10 +199,18 @@ class OmnigentAgent(AgentAdapter):
     ) -> str:
         agent_id, agent_name = await self._agent_for(task, phase)
         harness = (task.harness or "").strip() or settings.omnigent_default_harness
+        host_id = (task.host_id or "").strip() or settings.omnigent_host_id
+        if (task.compassx_app_id or "").strip():
+            logger.info(
+                "task %s executes on CompassX host %s (%s, app %s)",
+                task.id, host_id, task.host_name, task.compassx_app_id,
+            )
+        elif host_id != settings.omnigent_host_id:
+            logger.info("task %s executes on host %s", task.id, host_id)
         body: dict = {
             "agent_id": agent_id,
             "title": f"[{harness}] {task.title} (task {task.id[:8]})",
-            "host_id": settings.omnigent_host_id,
+            "host_id": host_id,
             "workspace": self._workspace_for(task),
         }
         if phase == "implement":
