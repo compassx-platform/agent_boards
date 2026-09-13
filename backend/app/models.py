@@ -48,7 +48,10 @@ class Task(Base):
     compassx_app_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     compassx_app_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Workspace created/resumed by CompassX dev/start (persisted for redo).
+    # workspace name == physical folder name on the dev host, e.g.
+    # "app-{app_id}/{name}" (per the updated API contract).
     compassx_workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    compassx_workspace_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Whether the completed changes were committed/pushed to git via dev/publish.
     compassx_published: Mapped[bool] = mapped_column(default=False)
     # Dev sandbox the task executed on (set by the provisioner at submit time).

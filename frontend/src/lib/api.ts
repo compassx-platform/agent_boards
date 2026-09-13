@@ -92,6 +92,7 @@ export interface Task {
   compassx_app_id: string | null
   compassx_app_name: string | null
   compassx_workspace_id: string | null
+  compassx_workspace_name: string | null
   compassx_published: boolean
   host_id: string | null
   host_name: string | null
@@ -240,6 +241,11 @@ export const api = {
   compassxApps: () => http<CompassXAppsResponse>('/compassx/apps'),
   compassxWorkspaces: (appId: string) =>
     http<CompassXWorkspacesResponse>(`/compassx/apps/${appId}/dev/workspaces`),
+  compassxCreateWorkspace: (appId: string, name: string, gitBranch?: string) =>
+    http<{ workspace: Record<string, unknown>; error: string | null }>(
+      `/compassx/apps/${appId}/dev/workspaces`,
+      { method: 'POST', body: JSON.stringify({ name, git_branch: gitBranch ?? 'main' }) },
+    ),
   compassxDevStatus: (appId: string) =>
     http<CompassXDevStatusResponse>(`/compassx/apps/${appId}/dev/status`),
   parse: (text: string) =>

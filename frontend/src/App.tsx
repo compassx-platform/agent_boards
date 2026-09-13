@@ -774,6 +774,10 @@ function TaskDetail({
                     <code>{task.workspace ?? 'new workspace on start'}</code>
                   </div>
                   <div>
+                    <span className="muted">workspace name</span>
+                    <code>{task.compassx_workspace_name ?? 'created on start'}</code>
+                  </div>
+                  <div>
                     <span className="muted">publish</span>
                     <strong>{task.compassx_published ? '✓ committed & pushed' : 'pending completion'}</strong>
                   </div>

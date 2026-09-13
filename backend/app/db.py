@@ -50,6 +50,7 @@ def ensure_columns() -> None:
         "compassx_app_id": "compassx_app_id VARCHAR(64)",
         "compassx_app_name": "compassx_app_name VARCHAR(255)",
         "compassx_workspace_id": "compassx_workspace_id VARCHAR(64)",
+        "compassx_workspace_name": "compassx_workspace_name VARCHAR(255)",
         "compassx_published": "compassx_published BOOLEAN DEFAULT 0",
         "host_id": "host_id VARCHAR(64)",
         "host_name": "host_name VARCHAR(255)",

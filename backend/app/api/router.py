@@ -374,8 +374,8 @@ async def compassx_apps() -> dict:
     try:
         apps = await compassx.list_apps()
     except Exception as exc:  # noqa: BLE001 - surface reachability to the UI
-        return {"apps": [], "error": str(exc), "configured": bool(settings.compassx_api_token)}
-    return {"apps": apps, "error": None, "configured": bool(settings.compassx_api_token)}
+        return {"apps": [], "error": str(exc), "configured": compassx.enabled}
+    return {"apps": apps, "error": None, "configured": compassx.enabled}
 
 
 @router.get("/compassx/apps/{app_id}/dev/workspaces")
@@ -386,6 +386,24 @@ async def compassx_dev_workspaces(app_id: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"workspaces": [], "error": str(exc)}
     return {"workspaces": workspaces, "error": None}
+
+
+class CompassXWorkspaceCreate(BaseModel):
+    name: str
+    git_branch: str = "main"
+
+
+@router.post("/compassx/apps/{app_id}/dev/workspaces")
+async def compassx_dev_workspaces_create(app_id: str, payload: CompassXWorkspaceCreate) -> dict:
+    """Pre-create a named dev workspace (workspace name == physical folder).
+    Idempotent: an existing name returns the workspace with already_exists=true."""
+    try:
+        workspace = await compassx.create_dev_workspace(
+            app_id, payload.name, payload.git_branch
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"workspace": {}, "error": str(exc)}
+    return {"workspace": workspace, "error": None}
 
 
 @router.get("/compassx/apps/{app_id}/dev/status")

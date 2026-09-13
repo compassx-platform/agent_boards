@@ -77,8 +77,16 @@ class Settings(BaseSettings):
     # app first spins up a remote dev host via these endpoints ("dev/start"),
     # waits for it to come online, verifies it is registered with the Omnigent
     # server, and only then runs the task's agent session on that host.
-    compassx_api_url: str = "http://135.13.180.167/api/v1"
+    compassx_api_url: str = "https://compassx.135.13.180.167.nip.io/api/v1"
     compassx_api_token: str = ""
+    # Fallback auth when no service-account token is set: the client logs in via
+    # POST {root}/api/um/auth/login and caches the access_token as a Bearer.
+    # Temporary hardcoded credentials — rotate / move to env-config later.
+    compassx_login_email: str = "vishalgvora@gmail.com"
+    compassx_login_password: str = "12345678"
+    # The nip.io CompassX host serves a self-signed TLS cert; disable verification
+    # by default and flip on once a proper cert is installed (or ignore for HTTPS).
+    compassx_verify_tls: bool = False
     compassx_workspace_id: str = ""
     compassx_workspace_slug: str = "default"
     # Host bring-up polling when dev/start returns host_online: false.

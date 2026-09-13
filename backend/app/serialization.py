@@ -89,6 +89,7 @@ def serialize_task(db: Session, task: Task) -> dict:
         "compassx_app_id": task.compassx_app_id,
         "compassx_app_name": task.compassx_app_name,
         "compassx_workspace_id": task.compassx_workspace_id,
+        "compassx_workspace_name": task.compassx_workspace_name,
         "compassx_published": task.compassx_published,
         "host_id": task.host_id,
         "host_name": task.host_name,

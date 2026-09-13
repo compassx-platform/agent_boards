@@ -100,19 +100,30 @@ hosts** managed by the CompassX platform instead of the local Omnigent host.
   from `GET /compassx/apps` in the create-task form). The app, its repo, and
   existing dev workspaces come from the CompassX API.
 * When a bound task **starts execution** the orchestrator:
-  1. checks `GET /api/v1/apps/{app_id}/dev/status` (reuse if already healthy),
-  2. else `POST /api/v1/apps/{app_id}/dev/start` (resumes `compassx_workspace_id`
-     when set, otherwise a fresh workspace is cloned),
+  1. resolves the target dev workspace — a **redo** task resumes its stored
+     `compassx_workspace_id`; otherwise a *named* workspace is pre-created via
+     `POST /api/v1/apps/{app_id}/dev/workspaces` (workspace name == physical
+     folder, derived from the task title + task id; idempotent across retries
+     and plan→implement),
+  2. checks `GET /api/v1/apps/{app_id}/dev/status` and reuses the sandbox only
+     when it already references that workspace, else
+     `POST /api/v1/apps/{app_id}/dev/start` with `workspace_name` (or
+     `workspace_id`),
   3. polls `dev/status` every ~2s until `host_online: true`, then
   4. **verifies the host is online on the Omnigent server** (`GET /v1/hosts`)
-     and only then submits the agent session on that `host_id`.
+     and only then submits the agent session on that `host_id`, bound to the
+     workspace folder (`/workspaces/app-{app_id}/{workspace_name}`).
 * On successful completion (`done` — auto-approved or human-approved) the
   completed changes are committed & pushed to git via
   `POST /api/v1/apps/{app_id}/dev/publish`, tracked by `compassx_published`.
 
-Set `TASKEXEC_COMPASSX_API_TOKEN` (and optionally `TASKEXEC_COMPASSX_API_URL`,
-`TASKEXEC_COMPASSX_WORKSPACE_ID`, `TASKEXEC_COMPASSX_WORKSPACE_SLUG`) to enable
-the flow. Without a token, bound tasks fail gracefully with a retry backoff and
+Set `TASKEXEC_COMPASSX_API_TOKEN` to use a service-account token, or leave it
+empty to authenticate automatically via the CompassX login endpoint using
+`TASKEXEC_COMPASSX_LOGIN_EMAIL` / `TASKEXEC_COMPASSX_LOGIN_PASSWORD`
+(temporary creds are baked into `backend/app/config.py` until a real token is
+provisioned). Also optionally set `TASKEXEC_COMPASSX_API_URL`,
+`TASKEXEC_COMPASSX_WORKSPACE_ID`, `TASKEXEC_COMPASSX_WORKSPACE_SLUG`. Without
+any auth configured, bound tasks fail gracefully with a retry backoff and
 unbound tasks keep running on the local host exactly as before.
 
 ## Plaid checkout
@@ -155,6 +166,7 @@ a PR on `git@github.raw:compassx-platform/agent_boards`-style branches
 - `POST /demo/seed`
 - `GET /compassx/apps` — CompassX apps for the task picker
 - `GET /compassx/apps/{app_id}/dev/workspaces` — existing dev workspaces
+- `POST /compassx/apps/{app_id}/dev/workspaces` — pre-create a named workspace
 - `GET /compassx/apps/{app_id}/dev/status` — sandbox/host health
 - `POST /compassx/apps/{app_id}/dev/stop` — stop the sandbox to free compute
 

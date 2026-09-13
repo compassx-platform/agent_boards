@@ -144,6 +144,8 @@ class Orchestrator:
                 task.host_id = host.get("host_id") or task.host_id
                 task.host_name = host.get("host_name") or task.host_name
                 task.compassx_workspace_id = host.get("workspace_id") or task.compassx_workspace_id
+                if host.get("workspace_name"):
+                    task.compassx_workspace_name = host["workspace_name"]
                 if host.get("workspace"):
                     task.workspace = host["workspace"]
                 if host.get("dev_url"):

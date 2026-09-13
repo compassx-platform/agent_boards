@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import httpx
 
@@ -18,20 +19,44 @@ class HostProvisioner:
     Flow (per compassx-api-contract.txt):
       1. If the task has no compassx_app_id, execution stays on the configured
          default host (settings.omnigent_host_id) — no provisioning.
-      2. Otherwise check the existing dev sandbox (dev/status). If it is already
-         active and connected, reuse it (idempotent for retries / plan→implement).
-      3. Else POST dev/start {workspace_id} (reuse a prior workspace or make a
-         fresh clone) and poll dev/status every ~2s until host_online: true.
+      2. Otherwise determine the target dev workspace:
+         - task.compassx_workspace_id is set (redo / reuse)  -> dev/start with
+           that workspace_id.
+         - otherwise pre-create a NAMED workspace via POST /dev/workspaces
+           (workspace name == physical folder, e.g. app-{id}/{task-slug-xxxx}),
+           then dev/start with that workspace_name. Idempotent across retries /
+           plan→implement via already_exists.
+      3. Reuse an already-active sandbox only when it already references the
+         target workspace; otherwise dev/start attaches the workspace to the
+         pod. Poll dev/status every ~2s until host_online: true.
       4. Verify the returned host_id is actually online on the Omnigent server
          (GET /v1/hosts) before returning — execution never starts on a host
          that Omnigent has not seen.
 
-    The caller persists the returned {host_id, host_name, workspace, dev_url,
-    workspace_id} back onto the task row.
+    The caller persists the returned {host_id, host_name, workspace,
+    workspace_id, workspace_name, dev_url} back onto the task row.
     """
 
     def __init__(self, client: CompassXClient | None = None) -> None:
         self.client = client or compassx
+
+    # ------------------------------------------------------------ workspace
+
+    @staticmethod
+    def workspace_name_for(task_id: str, title: str) -> str:
+        """Deterministic, human-readable workspace name for a task.
+
+        The workspace name == physical folder name (no date/hash prefixes, per
+        contract). Derived from the task title with the short task id appended
+        so distinct tasks never collide (already_exists stays a pure retry
+        idempotency signal).
+        """
+        raw = (title or "task").strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")[:48]
+        if not slug:
+            slug = "task"
+        suffix = (task_id or "")[:8] or "task"
+        return f"{slug}-{suffix}"
 
     # -------------------------------------------------------------- omnigent
 
@@ -81,6 +106,19 @@ class HostProvisioner:
 
     # ------------------------------------------------------------- compassx
 
+    @staticmethod
+    def _status_matches_target(
+        status: dict, workspace_id: str | None, workspace_name: str | None
+    ) -> bool:
+        """True when an already-active sandbox references the target workspace."""
+        id_ = str(status.get("workspace_id") or "").strip()
+        name = str(status.get("workspace_name") or "").strip()
+        if workspace_id:
+            return bool(id_ == workspace_id or name == workspace_id)
+        if workspace_name:
+            return bool(name == workspace_name or id_ == workspace_name)
+        return True
+
     async def _dev_status_ready(self, status: dict) -> bool:
         return (
             bool(status)
@@ -98,6 +136,7 @@ class HostProvisioner:
                 "host_id": settings.omnigent_host_id,
                 "host_name": task.host_name or "",
                 "workspace_id": task.compassx_workspace_id or "",
+                "workspace_name": "",
                 "workspace": (task.workspace or "").strip() or settings.omnigent_workspace,
                 "dev_url": "",
             }
@@ -107,21 +146,44 @@ class HostProvisioner:
                 f"{app_id!r} but TASKEXEC_COMPASSX_API_TOKEN is not configured"
             )
 
-        # 1) Reuse an already-active sandbox (idempotent across retries/phases).
+        # 1) Resolve the target dev workspace. A redo task reuses its stored
+        #    workspace by id; otherwise a NAMED workspace is pre-created via the
+        #    contract's POST /dev/workspaces (idempotent: already_exists=true on
+        #    retries / plan→implement). Workspace name == physical folder name.
+        workspace_id = (task.compassx_workspace_id or "").strip() or None
+        workspace_name = None
+        if not workspace_id:
+            workspace_name = self.workspace_name_for(task.id, task.title)
+            created = await self.client.create_dev_workspace(app_id, workspace_name)
+            workspace_name = str(created.get("name") or workspace_name).strip()
+            logger.info(
+                "workspace for app %s -> %s (already_exists=%s)",
+                app_id,
+                workspace_name,
+                str(created.get("already_exists", False)).lower(),
+            )
+
+        # 2) Reuse an already-active sandbox only when it already references
+        #    this task's workspace; otherwise (re)attach it via dev/start.
         try:
             status = await self.client.dev_status(app_id)
         except CompassXError:
             logger.warning("dev/status failed for app %s; proceeding to dev/start", app_id)
             status = {}
 
-        if not await self._dev_status_ready(status):
-            # 2) Start (or resume) the sandbox.
-            started = await self.client.dev_start(app_id, workspace_id=task.compassx_workspace_id)
+        if not (
+            await self._dev_status_ready(status)
+            and self._status_matches_target(status, workspace_id, workspace_name)
+        ):
+            started = await self.client.dev_start(
+                app_id, workspace_name=workspace_name, workspace_id=workspace_id
+            )
             logger.info(
-                "dev/start for app %s -> host %s (%s), workspace %s",
+                "dev/start for app %s -> host %s (%s), workspace %s (%s)",
                 app_id,
                 started.get("host_id"),
                 started.get("host_name"),
+                started.get("workspace_name") or workspace_name,
                 started.get("workspace_id"),
             )
             status = started
@@ -157,15 +219,23 @@ class HostProvisioner:
                 f"rejecting execution for app {app_id}"
             )
 
-        folder_path = str(status.get("folder_path") or "").strip()
+        # Workspace folder on the dev host. Prefer the contract's
+        # workspace_folder (== app-{app_id}/{workspace_name}); fall back to the
+        # older folder_path, then derive from the workspace name itself.
+        folder = str(
+            status.get("workspace_folder") or status.get("folder_path") or ""
+        ).strip()
         workspace = task.workspace or settings.omnigent_workspace
-        if folder_path:
-            workspace = "/workspaces/" + folder_path.strip("/")
+        if folder:
+            workspace = "/workspaces/" + folder.strip("/")
+        elif workspace_name:
+            workspace = f"/workspaces/app-{app_id}/{workspace_name}"
 
         return {
             "host_id": host_id,
             "host_name": str(status.get("host_name") or ""),
-            "workspace_id": str(status.get("workspace_id") or task.compassx_workspace_id or ""),
+            "workspace_id": str(status.get("workspace_id") or workspace_id or ""),
+            "workspace_name": str(status.get("workspace_name") or workspace_name or ""),
             "workspace": workspace,
             "dev_url": str(status.get("dev_url") or ""),
             "app_identifier": str(status.get("app_identifier") or ""),
