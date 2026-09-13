@@ -36,3 +36,17 @@ def get_session():
         yield db
     finally:
         db.close()
+
+
+def ensure_columns() -> None:
+    """Idempotent dev migration: add columns that don't exist yet (SQLite)."""
+    if not _is_sqlite:
+        return
+    from sqlalchemy import inspect, text
+
+    cols = {c["name"] for c in inspect(engine).get_columns("tasks")}
+    if "harness" not in cols:
+        with engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE tasks ADD COLUMN harness VARCHAR(64) DEFAULT 'opencode-native'")
+            )

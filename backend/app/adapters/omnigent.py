@@ -53,12 +53,57 @@ class OmnigentAgent(AgentAdapter):
 
     # ---------------------------------------------------------------- helpers
 
-    def _agent_for(self, phase: str) -> str:
-        if phase == "plan":
-            return settings.omnigent_plan_agent_id
-        if phase == "implement":
-            return settings.omnigent_implement_agent_id
-        return settings.omnigent_implement_agent_id
+    async def _list_agents(self) -> list[dict]:
+        """Live GET /v1/agents. Return [] and warn when unreachable."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/agents",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                logger.warning("omnigent /v1/agents failed: %s %s", resp.status_code, resp.text[:200])
+                return []
+            data = resp.json()
+            rows = data if isinstance(data, list) else data.get("data", data.get("agents", []))
+            return rows or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("omnigent /v1/agents unreachable: %s", exc)
+            return []
+
+    async def _agent_for(self, task: Task, phase: str) -> tuple[str, str]:
+        """Resolve a fresh agent_id for the task's harness from the live server.
+
+        harness is the stable reference — agent ids/names can change between
+        releases, so we re-query on every submit. Falls back to the configured
+        plan/implement agent ids if no harness match is found.
+        """
+        harness = (task.harness or "").strip() or settings.omnigent_default_harness
+        preferred = (
+            settings.omnigent_plan_agent_id
+            if phase == "plan"
+            else settings.omnigent_implement_agent_id
+        )
+        rows = await self._list_agents()
+        matches = [a for a in rows if (a.get("harness") or "") == harness]
+        if matches:
+            for a in matches:
+                if a.get("id") == preferred:
+                    return a["id"], a.get("name", "")
+            first = matches[0]
+            logger.info(
+                "harness %r resolved to agent %s (%s) for phase=%s",
+                harness, first.get("id"), first.get("name"), phase,
+            )
+            return first["id"], first.get("name", "")
+        for a in rows:
+            if a.get("id") == preferred:
+                return preferred, a.get("name", "")
+        logger.warning(
+            "no live agent for harness %r; falling back to configured %s (%s)",
+            harness, preferred, phase,
+        )
+        return preferred, ""
 
     def _workspace_for(self, task: Task) -> str:
         return (task.workspace or "").strip() or settings.omnigent_workspace
@@ -152,10 +197,11 @@ class OmnigentAgent(AgentAdapter):
         artifacts_dir: str,
         phase: str = "execute",
     ) -> str:
-        agent_id = self._agent_for(phase)
+        agent_id, agent_name = await self._agent_for(task, phase)
+        harness = (task.harness or "").strip() or settings.omnigent_default_harness
         body: dict = {
             "agent_id": agent_id,
-            "title": f"[{phase}] {task.title} (task {task.id[:8]})",
+            "title": f"[{harness}] {task.title} (task {task.id[:8]})",
             "host_id": settings.omnigent_host_id,
             "workspace": self._workspace_for(task),
         }
@@ -204,6 +250,8 @@ class OmnigentAgent(AgentAdapter):
             "artifacts_dir": artifacts_dir,
             "session_id": session_id,
             "agent_id": agent_id,
+            "agent_name": agent_name,
+            "harness": harness,
         }
         return session_id
 
@@ -280,7 +328,8 @@ class OmnigentAgent(AgentAdapter):
 
         log_path = artifacts_dir / "run.log"
         log_path.write_text(
-            f"session: {session_id}\nphase: {entry['phase']}\nagent: {entry['agent_id']}\n"
+            f"session: {session_id}\nphase: {entry['phase']}\n"
+            f"harness: {entry.get('harness')}\nagent: {entry.get('agent_id')} ({entry.get('agent_name', '')})\n"
             f"output_len: {len(output)}\ntools: {tools}\nfailure: {fail_msg or '(none)'}\n"
         )
 

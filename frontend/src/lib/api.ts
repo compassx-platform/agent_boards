@@ -87,6 +87,7 @@ export interface Task {
   status: Status
   created_by: string
   agent_capability: string
+  harness: string
   workspace: string | null
   current_attempt: number
   max_attempts: number
@@ -95,6 +96,9 @@ export interface Task {
   plan_status: PlanStatus
   plan_text: string | null
   pr_url: string | null
+  session_id: string | null
+  session_link: string | null
+  session_provider: string | null
   depends_on: string[]
   created_at: string
   updated_at: string
@@ -121,10 +125,25 @@ export interface TaskCreateInput {
   max_attempts?: number
   plan_required?: boolean
   workspace?: string
+  harness?: string
   context?: { type: string; ref: string; description?: string }[]
   criteria: { description: string; check_type: CheckType; check_config: Record<string, unknown> }[]
   depends_on?: string[]
 }
+
+export interface HarnessInfo {
+  name: string
+  agents: { id: string; name: string }[]
+}
+
+export interface HarnessesResponse {
+  harnesses: HarnessInfo[]
+  default: string
+  adapter: string
+  source: string
+}
+
+export const DEFAULT_HARNESS = 'opencode-native'
 
 const BASE = '/api/v1'
 
@@ -168,6 +187,7 @@ export const api = {
   metrics: () => http<Metrics>('/metrics'),
   capabilities: () =>
     http<{ name: string; adapter: string }[]>('/capabilities'),
+  harnesses: () => http<HarnessesResponse>('/harnesses'),
   parse: (text: string) =>
     http<{ parsed: Partial<TaskCreateInput>; confidence: number; note: string }>('/parse', {
       method: 'POST',

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import Float, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -36,6 +36,9 @@ class Task(Base):
     status: Mapped[str] = mapped_column(String(32), default="backlog", index=True)
     created_by: Mapped[str] = mapped_column(String(128), default="creator@example.com")
     agent_capability: Mapped[str] = mapped_column(String(128), default="default")
+    # Omnigent harness (execution engine) this task runs under. Stored per task;
+    # resolved to a fresh agent_id against the live server at submit time.
+    harness: Mapped[str] = mapped_column(String(64), default="opencode-native")
     # Optional per-task workspace override: the host directory of the app/repo
     # the agent should work in. Falls back to settings.omnigent_workspace.
     workspace: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -164,3 +167,30 @@ class AuditLog(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     task: Mapped[Task] = relationship(back_populates="audits")
+
+
+class PlaidAccount(Base):
+    __tablename__ = "plaid_accounts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    plaid_account_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    item_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    access_token: Mapped[str] = mapped_column(Text)
+    bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    account_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    account_mask: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    plaid_account_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plaid_accounts.id"), nullable=True, index=True
+    )
+    amount: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    status: Mapped[str] = mapped_column(String(32), default="paid")
+    reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)

@@ -89,6 +89,25 @@ A demo set of tasks is seeded automatically on first start (`POST /api/v1/demo/s
 to add more). To see the auto-retry path, put `(fail_once)` in a task's intent —
 the simulated agent deliberately fails the first attempt.
 
+## Plaid checkout
+
+A "Pay with bank" button in the top bar runs a Plaid Link checkout so users can
+pay from a connected bank account. The flow:
+
+```
+POST /api/v1/payments/plaid/link_token      → Plaid Link token
+Plaid Link (user connects bank)             → public_token
+POST /api/v1/payments/plaid/exchange        → access_token + linked account (stored)
+POST /api/v1/payments/checkout              → records a Payment, returns status: success
+```
+
+Set `TASKEXEC_PLAID_CLIENT_ID`, `TASKEXEC_PLAID_SECRET`, and
+`TASKEXEC_PLAID_ENV` (default `sandbox`) to hit the real Plaid API. When the
+credentials are left unset the backend serves a **deterministic sandbox mock**
+(returns a fake link/access token and a sample account), so the entire flow
+works with zero external keys. Plaid Link loads in the browser from
+`https://cdn.plaid.com/link/v2/stable/link-stable.min.js` (no npm dependency).
+
 ## Plan-first flow
 
 Create a task with `plan_required: true` (the UI has a toggle; `/parse` and the

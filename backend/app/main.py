@@ -8,13 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import seed_demo  # noqa: F401
 from app.config import settings
-from app.db import Base, SessionLocal, engine
+from app.db import Base, SessionLocal, engine, ensure_columns
 
 logging.basicConfig(level=logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    ensure_columns()
     Base.metadata.create_all(bind=engine)
     if settings.seed_on_startup:
         db = SessionLocal()
@@ -50,8 +51,10 @@ app.add_middleware(
 )
 
 from app.api.router import router  # noqa: E402
+from app.api.payments import router as payments_router  # noqa: E402
 
 app.include_router(router, prefix=settings.api_prefix)
+app.include_router(payments_router, prefix=settings.api_prefix)
 
 
 @app.get("/")

@@ -87,6 +87,38 @@ textarea:focus {
 .logo {
   color: var(--accent);
 }
+.adapter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
+  text-transform: capitalize;
+}
+.adapter-chip.adapter-omnigent {
+  color: #ffd60a;
+  border-color: rgba(255, 214, 10, 0.45);
+  background: rgba(255, 214, 10, 0.08);
+}
+.adapter-chip.adapter-opencode {
+  color: #30d158;
+  border-color: rgba(48, 209, 88, 0.45);
+  background: rgba(48, 209, 88, 0.08);
+}
+.adapter-chip.adapter-simulated {
+  color: #8e8e93;
+  border-color: var(--border);
+}
+.harness-chip {
+  color: #bf5af2;
+  border-color: rgba(191, 90, 242, 0.45);
+  background: rgba(191, 90, 242, 0.08);
+}
 .topbar nav {
   display: flex;
   gap: 4px;
@@ -116,6 +148,21 @@ textarea:focus {
 }
 .stats .warn {
   color: var(--warn);
+}
+
+.checkout {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.checkout.paid {
+  font-size: 13px;
+  font-weight: 600;
+  color: #30d158;
+}
+.checkout-error {
+  font-size: 12px;
+  color: #ff8a80;
 }
 
 .content {
