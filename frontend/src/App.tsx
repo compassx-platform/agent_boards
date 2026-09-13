@@ -6,8 +6,10 @@ import type {
   Criterion,
   Priority,
   RiskTier,
+  HarnessesResponse,
 } from './lib/api'
-import { BOARD_COLUMNS, PLAN_STATUS_META, STATUS_META, readStream, timeAgo, api } from './lib/api'
+import { BOARD_COLUMNS, DEFAULT_HARNESS, PLAN_STATUS_META, STATUS_META, readStream, timeAgo, api } from './lib/api'
+import Checkout from './components/Checkout'
 import './App.css'
 
 // ------------------------------------------------------------------------- data
@@ -15,14 +17,21 @@ function useTaskStore() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [metrics, setMetrics] = useState<Metrics | null>(null)
   const [caps, setCaps] = useState<{ name: string; adapter: string }[]>([])
+  const [harnessData, setHarnessData] = useState<HarnessesResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [t, m, c] = await Promise.all([api.listTasks(), api.metrics(), api.capabilities()])
+      const [t, m, c, h] = await Promise.all([
+        api.listTasks(),
+        api.metrics(),
+        api.capabilities(),
+        api.harnesses(),
+      ])
       setTasks(t)
       setMetrics(m)
       setCaps(c)
+      setHarnessData(h)
       setError(null)
     } catch (e) {
       setError(String(e))
@@ -41,7 +50,7 @@ function useTaskStore() {
     }
   }, [refresh])
 
-  return { tasks, metrics, caps, error, refresh }
+  return { tasks, metrics, caps, harnessData, error, refresh }
 }
 
 // ------------------------------------------------------------------------ bits
@@ -61,13 +70,15 @@ function Chip({
   children,
   className = '',
   style,
+  title,
 }: {
   children: React.ReactNode
   className?: string
   style?: React.CSSProperties
+  title?: string
 }) {
   return (
-    <span className={`chip ${className}`} style={style}>
+    <span className={`chip ${className}`} style={style} title={title}>
       {children}
     </span>
   )
@@ -95,8 +106,10 @@ function TaskCard({ task, onClick }: { task: Task; onClick: (id: string) => void
       <div className="task-card-meta">
         <Chip className={PRIORITY_CLASS[task.priority]}>{task.priority}</Chip>
         <Chip className={RISK_CLASS[task.risk_tier]}>{task.risk_tier}</Chip>
+        <Chip className="harness-chip" title="omnigent harness">{task.harness || DEFAULT_HARNESS}</Chip>
         <Chip>attempt {task.current_attempt + (task.status === 'executing' || task.status === 'verifying' ? 1 : 0)}/{task.max_attempts}</Chip>
         {task.escalation_reason && <Chip className="r-high">escalated</Chip>}
+        {task.session_id && <Chip title="agent session">⚡ {task.session_id}</Chip>}
       </div>
       <div className="task-card-foot">
         <span>{task.agent_capability}</span>
@@ -167,11 +180,13 @@ interface ContextDraft {
 function NewTaskForm({
   tasks,
   caps,
+  harnessData,
   refresh,
   onCreated,
 }: {
   tasks: Task[]
   caps: { name: string; adapter: string }[]
+  harnessData: HarnessesResponse | null
   refresh: () => Promise<void>
   onCreated: (id: string) => void
 }) {
@@ -180,6 +195,7 @@ function NewTaskForm({
   const [priority, setPriority] = useState<Priority>('normal')
   const [risk, setRisk] = useState<RiskTier>('low')
   const [capability, setCapability] = useState('default')
+  const [harness, setHarness] = useState(harnessData?.default ?? DEFAULT_HARNESS)
   const [planRequired, setPlanRequired] = useState(false)
   const [workspace, setWorkspace] = useState('')
   const [deps, setDeps] = useState<string[]>([])
@@ -198,6 +214,7 @@ function NewTaskForm({
     if (p.priority) setPriority(p.priority)
     if (p.risk_tier) setRisk(p.risk_tier)
     if (p.agent_capability) setCapability(p.agent_capability)
+    if (p.harness) setHarness(p.harness)
     if (p.plan_required !== undefined) setPlanRequired(p.plan_required)
     if (p.workspace) setWorkspace(p.workspace)
     if (p.criteria && p.criteria.length) {
@@ -236,6 +253,7 @@ function NewTaskForm({
         priority,
         risk_tier: risk,
         agent_capability: capability,
+        harness,
         plan_required: planRequired,
         workspace: workspace.trim() || undefined,
         depends_on: deps,
@@ -318,6 +336,21 @@ function NewTaskForm({
                 </option>
               ))}
             </select>
+          </div>
+          <div className="field">
+            <label>Harness (agent engine)</label>
+            <select value={harness} onChange={(e) => setHarness(e.target.value)}>
+              {(harnessData?.harnesses ?? []).map((h) => (
+                <option key={h.name} value={h.name}>
+                  {h.name}
+                  {h.name === harnessData?.default ? ' (default)' : ''}
+                </option>
+              ))}
+              {!harnessData && <option value={harness}>{harness}</option>}
+            </select>
+            <p className="muted">
+              Resolved to its current agent on the Omnigent server at execution time.
+            </p>
           </div>
         </div>
 
@@ -612,7 +645,8 @@ function TaskDetail({
           <div>
             <h2>{task.title}</h2>
             <p className="muted">
-              {task.id.slice(0, 8)} · {task.priority} · risk {task.risk_tier} · {task.agent_capability} · workspace{' '}
+              {task.id.slice(0, 8)} · {task.priority} · risk {task.risk_tier} · {task.agent_capability} · harness{' '}
+              <code>{task.harness || DEFAULT_HARNESS}</code> · workspace{' '}
               <code>{task.workspace ?? 'default'}</code> · created {timeAgo(task.created_at)} by {task.created_by}
             </p>
           </div>
@@ -629,6 +663,18 @@ function TaskDetail({
               {task.escalation_reason && <Chip className="r-high">⏫ escalated</Chip>}
             </div>
             {task.escalation_reason && <p className="reason">Reason: {task.escalation_reason}</p>}
+
+            {task.session_id && (
+              <div className="session-id-line">
+                <Chip className="r-medium">{task.session_provider ?? 'agent'} session</Chip>
+                <code>{task.session_id}</code>
+                {task.session_link ? (
+                  <a href={task.session_link} target="_blank" rel="noreferrer">
+                    open
+                  </a>
+                ) : null}
+              </div>
+            )}
 
             {task.plan_required && (
               <section className="plan-detail">
@@ -804,7 +850,7 @@ function TaskDetail({
 
 // -------------------------------------------------------------------------- app
 export default function App() {
-  const { tasks, metrics, caps, error, refresh } = useTaskStore()
+  const { tasks, metrics, caps, harnessData, error, refresh } = useTaskStore()
   const [view, setView] = useState<'board' | 'new' | 'reviews'>('board')
   const [selected, setSelected] = useState<string | null>(null)
 
@@ -813,6 +859,7 @@ export default function App() {
   }, [view])
 
   const reviewCount = tasks.filter((t) => t.status === 'needs_review').length
+  const adapter = caps[0]?.adapter ?? '…'
 
   return (
     <div className="app-root">
@@ -820,6 +867,9 @@ export default function App() {
         <div className="brand">
           <span className="logo">◧</span> TaskExec
         </div>
+        <span className={`adapter-chip adapter-${adapter}`} title={`Agent execution adapter: ${adapter}`}>
+          ⚙ {adapter}
+        </span>
         <nav>
           <button className={view === 'board' ? 'active' : ''} onClick={() => setView('board')}>
             Board
@@ -844,6 +894,7 @@ export default function App() {
             </span>
           </div>
         )}
+        <Checkout />
       </header>
 
       {error && <ErrorBanner message={`Backend unreachable: ${error}`} />}
@@ -852,7 +903,7 @@ export default function App() {
         {view === 'board' ? (
           <Board tasks={tasks} onClick={setSelected} />
         ) : view === 'new' ? (
-          <NewTaskForm tasks={tasks} caps={caps} refresh={refresh} onCreated={(id) => setSelected(id)} />
+          <NewTaskForm tasks={tasks} caps={caps} harnessData={harnessData} refresh={refresh} onCreated={(id) => setSelected(id)} />
         ) : (
           <Reviews refresh={refresh} onOpen={setSelected} />
         )}

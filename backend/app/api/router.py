@@ -4,6 +4,7 @@ import json
 import re
 from typing import Literal
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
@@ -50,6 +51,7 @@ class TaskCreate(BaseModel):
     max_attempts: int | None = None
     plan_required: bool = False
     workspace: str | None = None
+    harness: str | None = None
     context: list[ContextRefIn] = []
     criteria: list[CriterionIn] = []
     depends_on: list[str] = []
@@ -110,6 +112,7 @@ def _build_task(db: Session, payload: TaskCreate, user: str) -> Task:
         plan_required=payload.plan_required,
         plan_status="none",
         workspace=(payload.workspace or "").strip() or None,
+        harness=(payload.harness or "").strip() or settings.omnigent_default_harness,
     )
     db.add(task)
     db.flush()
@@ -311,6 +314,48 @@ def capabilities() -> list[dict]:
     return [{"name": c, "adapter": adapter.name} for c in pool]
 
 
+@router.get("/harnesses")
+async def harnesses() -> dict:
+    """Live harness list from the Omnigent server.
+
+    harness is the stable per-task routing key (agent ids/names can change).
+    The agent_id for a task's harness is re-resolved against this list at every
+    submit, so the ids here are informational for the UI picker only.
+    """
+    headers = (
+        {"Authorization": f"Bearer {settings.omnigent_api_key}"}
+        if settings.omnigent_api_key
+        else {}
+    )
+    rows: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(f"{settings.omnigent_api_url}/v1/agents", headers=headers)
+        if resp.status_code < 400:
+            data = resp.json()
+            rows = data if isinstance(data, list) else data.get("data", data.get("agents", []))
+    except Exception:  # noqa: BLE001
+        rows = []
+
+    grouped: dict[str, list[dict]] = {}
+    for a in rows:
+        harness = str(a.get("harness") or "").strip()
+        if not harness:
+            continue
+        grouped.setdefault(harness, []).append(
+            {"id": a.get("id"), "name": a.get("name")}
+        )
+    return {
+        "harnesses": [
+            {"name": h, "agents": grouped[h]}
+            for h in sorted(grouped)
+        ],
+        "default": settings.omnigent_default_harness,
+        "adapter": settings.adapter,
+        "source": "live" if rows else "unavailable",
+    }
+
+
 @router.post("/parse")
 def parse_intent(payload: ParseRequest) -> dict:
     """Conversational task creation (heuristic stand-in — wire an LLM here for Phase 3)."""
@@ -370,6 +415,11 @@ def parse_intent(payload: ParseRequest) -> dict:
         if m:
             ws = m.group(1)
 
+    harness = None
+    m = re.search(r"\bharness\s*[:=]\s*([A-Za-z0-9_-]+)", text, re.IGNORECASE)
+    if m:
+        harness = m.group(1).strip().lower()
+
     return {
         "parsed": {
             "title": title,
@@ -379,6 +429,7 @@ def parse_intent(payload: ParseRequest) -> dict:
             "agent_capability": "default",
             "plan_required": plan_required,
             "workspace": ws,
+            "harness": harness,
             "criteria": criteria,
         },
         "confidence": 0.6,

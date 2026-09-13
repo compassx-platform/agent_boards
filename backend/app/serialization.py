@@ -74,6 +74,7 @@ def session_out(s: "ExecutionSession") -> dict:
 def serialize_task(db: Session, task: Task) -> dict:
     deps = [d.id for d in task.deps(db)]
     latest_pr = next((a.pr_url for a in reversed(task.attempts) if a.pr_url), None)
+    latest_session = task.sessions[-1] if task.sessions else None
     return {
         "id": task.id,
         "title": task.title,
@@ -83,6 +84,7 @@ def serialize_task(db: Session, task: Task) -> dict:
         "status": task.status,
         "created_by": task.created_by,
         "agent_capability": task.agent_capability,
+        "harness": task.harness,
         "workspace": task.workspace,
         "current_attempt": task.current_attempt,
         "max_attempts": task.max_attempts,
@@ -91,6 +93,9 @@ def serialize_task(db: Session, task: Task) -> dict:
         "plan_status": task.plan_status,
         "plan_text": task.plan_text,
         "pr_url": latest_pr,
+        "session_id": latest_session.session_id if latest_session else None,
+        "session_link": latest_session.link if latest_session else None,
+        "session_provider": latest_session.provider if latest_session else None,
         "depends_on": deps,
         "created_at": _dt(task.created_at),
         "updated_at": _dt(task.updated_at),

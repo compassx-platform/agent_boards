@@ -75,6 +75,13 @@ class Settings(BaseSettings):
     # Session binding: this host + repo dir the Omnigent agent runs in.
     omnigent_host_id: str = "97e1d6b0299b58a7b4b8a7f1eeafaaf1"
     omnigent_workspace: str = "/workspaces/app-59f99ff8a7854a50/ws_945bbda579d44d4d"
+    # Per-task harness (execution engine family). This is the stable reference
+    # for routing: agent ids and display names can change on the server, but the
+    # harness of an agent stays put. The agent_id used at execution time is
+    # resolved fresh from GET /v1/agents by filtering on the task's harness.
+    # NOTE: the server has 15 harnesses; its opencode one is "opencode-native"
+    # (there is no harness literally named "opencode").
+    omnigent_default_harness: str = "opencode-native"
     omnigent_branch_prefix: str = "taskexec"
     # Per-phase agent mapping (ids from GET /v1/agents on the server).
     omnigent_plan_agent_id: str = "eac9e787e68ae6774d77e618031c287a"  # debby
@@ -83,6 +90,12 @@ class Settings(BaseSettings):
     robot_pr_url: str = "https://github.com/compassx-platform/agent_boards/pull/"
     simulator_min_seconds: float = 1.5
     simulator_max_seconds: float = 4.0
+
+    # Plaid bank-account checkout. Leave the client id/secret unset to run the
+    # deterministic sandbox mock so the whole flow works with zero keys.
+    plaid_client_id: str = ""
+    plaid_secret: str = ""
+    plaid_env: str = "sandbox"  # sandbox | development | production
 
     default_user: str = "creator@example.com"
     seed_on_startup: bool = True

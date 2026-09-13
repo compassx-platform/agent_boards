@@ -53,16 +53,14 @@ class OpenCodeAgent(AgentAdapter):
         return str(sid or "")
 
     async def _drain(self, entry: dict) -> None:
-        lines: list[bytes] = []
         try:
             while True:
                 line = await entry["proc"].stdout.readline()
                 if not line:
                     break
-                lines.append(line)
+                entry["lines"].append(line)
         except Exception:
             pass
-        entry["lines"] = lines
 
     def supports_capability(self, capability: str) -> bool:
         return True
