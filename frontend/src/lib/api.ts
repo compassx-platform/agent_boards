@@ -58,6 +58,16 @@ export interface Attempt {
   logs_ref: string | null
 }
 
+export interface TaskSession {
+  id: string
+  attempt_id: string | null
+  provider: string
+  session_id: string
+  link: string | null
+  status: string | null
+  created_at: string
+}
+
 export interface Audit {
   id: string
   ts: string
@@ -91,6 +101,7 @@ export interface Task {
   criteria: Criterion[]
   context: ContextRef[]
   attempts: Attempt[]
+  sessions: TaskSession[]
 }
 
 export interface Metrics {
@@ -148,6 +159,11 @@ export const api = {
       body: JSON.stringify({ action, note }),
     }),
   unblock: (id: string) => http<Task>(`/tasks/${id}/unblock`, { method: 'POST' }),
+  approveExecution: (id: string, note: string) =>
+    http<Task>(`/tasks/${id}/approve_execution`, {
+      method: 'POST',
+      body: JSON.stringify({ note }),
+    }),
   reviews: () => http<Task[]>('/reviews'),
   metrics: () => http<Metrics>('/metrics'),
   capabilities: () =>

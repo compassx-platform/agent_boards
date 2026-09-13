@@ -62,6 +62,9 @@ class Task(Base):
     attempts: Mapped[list["Attempt"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", order_by="Attempt.attempt_number"
     )
+    sessions: Mapped[list["ExecutionSession"]] = relationship(
+        back_populates="task", cascade="all, delete-orphan", order_by="ExecutionSession.created_at"
+    )
     audits: Mapped[list["AuditLog"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", order_by="AuditLog.ts"
     )
@@ -120,6 +123,32 @@ class Attempt(Base):
     logs_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     task: Mapped[Task] = relationship(back_populates="attempts")
+
+
+class ExecutionSession(Base):
+    """A single agent session bound to a task execution step.
+
+    One task can spawn many sessions (plan + implement phases, retries, etc.).
+    All of them are captured here so a reviewer can jump straight to the
+    original session (and its full transcript/logs) for any step.
+    """
+
+    __tablename__ = "execution_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), index=True)
+    attempt_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("attempts.id"), nullable=True, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32))  # opencode | omnigent | simulated
+    session_id: Mapped[str] = mapped_column(String(128))
+    link: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str | None] = mapped_column(String(16), nullable=True)  # running|finished|failed
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+    task: Mapped[Task] = relationship(back_populates="sessions")
+    attempt: Mapped[Attempt | None] = relationship()
 
 
 class AuditLog(Base):

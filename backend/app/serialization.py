@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import Attempt, Criterion, ContextRef, Task
+from app.models import Attempt, Criterion, ContextRef, ExecutionSession, Task
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -59,6 +59,18 @@ def attempt_out(a: Attempt) -> dict:
     }
 
 
+def session_out(s: "ExecutionSession") -> dict:
+    return {
+        "id": s.id,
+        "attempt_id": s.attempt_id,
+        "provider": s.provider,
+        "session_id": s.session_id,
+        "link": s.link,
+        "status": s.status,
+        "created_at": _dt(s.created_at),
+    }
+
+
 def serialize_task(db: Session, task: Task) -> dict:
     deps = [d.id for d in task.deps(db)]
     latest_pr = next((a.pr_url for a in reversed(task.attempts) if a.pr_url), None)
@@ -85,6 +97,7 @@ def serialize_task(db: Session, task: Task) -> dict:
         "criteria": [criterion_out(c) for c in task.criteria],
         "context": [context_ref_out(r) for r in task.context],
         "attempts": [attempt_out(a) for a in task.attempts],
+        "sessions": [session_out(s) for s in task.sessions],
     }
 
 

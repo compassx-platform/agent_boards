@@ -49,11 +49,27 @@ class Settings(BaseSettings):
     poll_interval_seconds: float = 1.0
     max_execution_seconds: int = 600
 
-    # Adapter: "simulated" (deterministic, local demo) or "omnigent" (real
-    # Omnigent server sessions). The lifecycle is identical either way: a
-    # plan_required task goes backlog → executing(plan) → needs_review(plan
-    # approval) → executing(implement) → verifying → done/needs_review.
-    adapter: str = "simulated"
+    # Adapter: "opencode" (real headless opencode CLI agent, the default) or
+    # "simulated" (deterministic demo backend, no real work) / "omnigent"
+    # (Omnigent server sessions — needs authenticated model creds on the host).
+    # The lifecycle is identical either way: a plan_required task goes
+    # backlog (human approval gate) → queued → executing(plan) →
+    # needs_review(plan approval) → queued → executing(implement) →
+    # verifying → done/needs_review.
+    adapter: str = "opencode"
+
+    # Headless opencode CLI execution backend (real work, real PRs).
+    opencode_bin: str = "opencode"
+    opencode_model: str = "opencode/big-pickle"
+    opencode_variant: str = ""  # e.g. "high" reasoning effort
+    opencode_auto: bool = True  # --auto: auto-approve agent tool permissions
+    opencode_workspace: str = "/workspaces/app-59f99ff8a7854a50/ws_945bbda579d44d4d"
+    opencode_branch_prefix: str = "taskexec"
+    opencode_base_branch: str = "main"
+    # Deep-link base for opencode sessions captured against a task (the CLI
+    # session id is appended). Leave empty to capture session ids only.
+    opencode_session_link_base: str = "opencode://session/"
+
     omnigent_api_url: str = "http://compassx-omnigent-server.compassx.svc.cluster.local:6767"
     omnigent_api_key: str = ""
     # Session binding: this host + repo dir the Omnigent agent runs in.

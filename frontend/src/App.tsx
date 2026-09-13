@@ -582,11 +582,12 @@ function TaskDetail({
     load()
   }, [load])
 
-  async function act(action: 'approve' | 'retry' | 'reject' | 'unblock' | 'approve_plan') {
+  async function act(action: 'approve' | 'retry' | 'reject' | 'unblock' | 'approve_plan' | 'approve_execution') {
     setBusy(true)
     setError(null)
     try {
       if (action === 'unblock') await api.unblock(id)
+      else if (action === 'approve_execution') await api.approveExecution(id, note)
       else await api.review(id, action as 'approve' | 'retry' | 'reject' | 'approve_plan', note)
       await load()
       await refresh()
@@ -716,6 +717,24 @@ function TaskDetail({
               </div>
             ))}
 
+            <h3>Sessions</h3>
+            {(task.sessions ?? []).length === 0 ? <p className="muted">No agent sessions yet.</p> : null}
+            {(task.sessions ?? []).map((s) => (
+              <div className="session" key={s.id}>
+                <div className="session-head">
+                  <Chip>{s.provider}</Chip>
+                  <code className="session-id">{s.session_id}</code>
+                  {s.status && <Chip>{s.status}</Chip>}
+                  <span className="muted">{timeAgo(s.created_at)}</span>
+                </div>
+                {s.link ? (
+                  <p><a href={s.link} target="_blank" rel="noreferrer">🔗 open session</a></p>
+                ) : (
+                  <p className="muted">no link recorded</p>
+                )}
+              </div>
+            ))}
+
             <h3>Audit trail</h3>
             <AuditList id={task.id} />
           </section>
@@ -757,6 +776,22 @@ function TaskDetail({
               <button disabled={busy} onClick={() => act('unblock')}>
                 Unblock
               </button>
+            </section>
+          )}
+
+          {task.status === 'backlog' && (
+            <section className="panel">
+              <h3>Backlog — pending human approval</h3>
+              <p className="muted">
+                Approved tasks move to the queue and start execution. A task is not
+                dispatched to the agent until a human approves it here.
+              </p>
+              <div className="row">
+                <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional)" />
+                <button className="ok" disabled={busy} onClick={() => act('approve_execution')}>
+                  Approve for execution
+                </button>
+              </div>
             </section>
           )}
 

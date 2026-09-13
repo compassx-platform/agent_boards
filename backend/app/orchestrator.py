@@ -12,7 +12,7 @@ from app.audit import log_action
 from app.config import RISK_RULES, settings
 from app.db import SessionLocal
 from app.events import bus
-from app.models import Attempt, Task
+from app.models import Attempt, ExecutionSession, Task
 from app.serialization import task_event
 from app.state_machine import transition, utcnow
 from app.verification import verify_attempt
@@ -72,7 +72,10 @@ class Orchestrator:
         db = SessionLocal()
         changed: set[str] = set()
         try:
-            self._promote_backlog(db, changed)
+            # NOTE: no backlog -> queued promotion here. Tasks start executing
+            # only after a human approves them for execution (POST
+            # /tasks/{id}/approve_execution). In-flight attempts are resumed by
+            # _start_available, which only looks at queued/executing.
             await self._start_available(db, changed)
             await self._poll_running(db, changed)
             db.commit()
@@ -82,23 +85,6 @@ class Orchestrator:
                     await bus.publish(task_event(task, db))
         finally:
             db.close()
-
-    # ------------------------------------------------------------- promote
-
-    def _promote_backlog(self, db: Session, changed: set[str]) -> None:
-        for task in db.query(Task).filter(Task.status == "backlog").all():
-            deps = task.deps(db)
-            if not deps:
-                transition(db, task, "queued", actor="orchestrator", reason="dependencies satisfied")
-                changed.add(task.id)
-                continue
-            if any(d.status not in {"done"} for d in deps):
-                if any(d.status in {"rejected", "blocked"} for d in deps):
-                    transition(db, task, "blocked", actor="orchestrator", reason="a dependency failed or is blocked")
-                    changed.add(task.id)
-                continue
-            transition(db, task, "queued", actor="orchestrator", reason="all dependencies done")
-            changed.add(task.id)
 
     # -------------------------------------------------------------- start
 
@@ -171,10 +157,45 @@ class Orchestrator:
 
     # --------------------------------------------------------------- poll
 
+    def _record_session(
+        self, db: Session, task_id: str, execution_id: str, session: dict, status: str
+    ) -> None:
+        provider = str(session.get("provider") or "")
+        sid = str(session.get("session_id") or "")
+        if not provider or not sid:
+            return
+        row = (
+            db.query(ExecutionSession)
+            .filter(
+                ExecutionSession.task_id == task_id,
+                ExecutionSession.provider == provider,
+                ExecutionSession.session_id == sid,
+            )
+            .first()
+        )
+        if row:
+            if session.get("link") and row.link != session["link"]:
+                row.link = session["link"]
+            row.status = status
+            row.updated_at = utcnow()
+        else:
+            db.add(
+                ExecutionSession(
+                    task_id=task_id,
+                    provider=provider,
+                    session_id=sid,
+                    link=session.get("link") or "",
+                    status=status,
+                )
+            )
+
     async def _poll_running(self, db: Session, changed: set[str]) -> None:
         for task_id in list(self._running.keys()):
             entry = self._running[task_id]
             status: ExecutionStatus = await self.adapter.poll(entry["execution_id"])
+            if status.session:
+                st = "running" if status.running else ("failed" if status.state == "failed" else "finished")
+                self._record_session(db, task_id, entry["execution_id"], status.session, st)
             if not status.running:
                 await self._finish_execution(db, task_id, changed)
 
@@ -189,6 +210,32 @@ class Orchestrator:
             .first()
         )
         result = await self.adapter.get_result(entry["execution_id"])
+
+        # Record the session(s) for this execution and link them to the attempt.
+        if result.session_id:
+            self._record_session(
+                db,
+                task_id,
+                entry["execution_id"],
+                {
+                    "provider": result.provider or self.adapter.name,
+                    "session_id": result.session_id,
+                    "link": result.session_link,
+                },
+                "failed" if not result.success else "finished",
+            )
+        if attempt:
+            unlinked = (
+                db.query(ExecutionSession)
+                .filter(
+                    ExecutionSession.task_id == task_id,
+                    ExecutionSession.attempt_id.is_(None),
+                )
+                .all()
+            )
+            for srow in unlinked:
+                srow.attempt_id = attempt.id
+
         risk = RISK_RULES.get(task.risk_tier, RISK_RULES["low"])
         max_attempts = task.max_attempts or risk["max_attempts"]
         auto_approve = risk["auto_approve"]

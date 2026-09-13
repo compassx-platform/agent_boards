@@ -211,6 +211,11 @@ class OmnigentAgent(AgentAdapter):
         entry = self._exec.get(execution_id)
         if not entry:
             return ExecutionStatus(running=False, state="finished", detail="unknown execution")
+        session = {
+            "provider": self.name,
+            "session_id": entry["session_id"],
+            "link": f"{settings.omnigent_api_url}/sessions/{entry['session_id']}",
+        }
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(
@@ -218,14 +223,14 @@ class OmnigentAgent(AgentAdapter):
                     headers=self._headers(),
                 )
             if resp.status_code >= 400:
-                return ExecutionStatus(running=False, state="failed", detail=f"poll error {resp.status_code}")
+                return ExecutionStatus(running=False, state="failed", detail=f"poll error {resp.status_code}", session=session)
             data = resp.json()
         except Exception as exc:  # transient network issue -> keep waiting
-            return ExecutionStatus(running=True, state="running", detail=str(exc))
+            return ExecutionStatus(running=True, state="running", detail=str(exc), session=session)
         state = data.get("status", "running")
         if state in {"idle", "failed"}:
-            return ExecutionStatus(running=False, state=state, detail=f"session {state}")
-        return ExecutionStatus(running=True, state=state, detail="…")
+            return ExecutionStatus(running=False, state=state, detail=f"session {state}", session=session)
+        return ExecutionStatus(running=True, state=state, detail="…", session=session)
 
     async def get_result(self, execution_id: str) -> ExecutionResult:
         entry = self._exec.pop(execution_id, None)
@@ -286,6 +291,9 @@ class OmnigentAgent(AgentAdapter):
             success=not fail_msg,
             plan=plan,
             pr_url=pr_url,
+            session_id=session_id,
+            provider=self.name,
+            session_link=f"{settings.omnigent_api_url}/sessions/{session_id}",
         )
 
     async def cancel(self, execution_id: str) -> bool:

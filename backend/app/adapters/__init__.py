@@ -12,6 +12,7 @@ class ExecutionStatus:
     state: str = "running"
     detail: str = ""
     logs: str = ""
+    session: dict | None = None  # {provider, session_id, link} when known
 
 
 @dataclass
@@ -22,6 +23,9 @@ class ExecutionResult:
     success: bool = True
     plan: str = ""
     pr_url: str = ""
+    session_id: str = ""
+    provider: str = ""
+    session_link: str = ""
 
 
 class AgentAdapter(abc.ABC):
@@ -68,4 +72,8 @@ def get_adapter(name: str) -> AgentAdapter:
         from app.adapters.omnigent import OmnigentAgent
 
         return OmnigentAgent()
+    if name == "opencode":
+        from app.adapters.opencode import OpenCodeAgent
+
+        return OpenCodeAgent()
     raise ValueError(f"Unknown adapter: {name}")

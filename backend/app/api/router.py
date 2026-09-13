@@ -78,6 +78,10 @@ class ReviewRequest(BaseModel):
     note: str = ""
 
 
+class NoteRequest(BaseModel):
+    note: str = ""
+
+
 def _current_user(request: Request) -> str:
     return request.headers.get("X-User", settings.default_user)
 
@@ -244,6 +248,34 @@ async def review_task(
     return serialize_task(db, task)
 
 
+@router.post("/tasks/{task_id}/approve_execution")
+def approve_execution(
+    task_id: str,
+    payload: NoteRequest | None = None,
+    request: Request = None,  # type: ignore[assignment]  # injected by FastAPI
+    db: Session = Depends(get_session),
+) -> dict:
+    """Human gate: a task starts execution only after approval from backlog."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status != "backlog":
+        raise HTTPException(status_code=409, detail=f"task is {task.status!r}; only backlog tasks can be approved for execution")
+    deps = task.deps(db)
+    unfinished = [d.id for d in deps if d.status != "done"]
+    if unfinished:
+        raise HTTPException(
+            status_code=409,
+            detail=f"dependencies not complete: {unfinished} — approve after they finish",
+        )
+    user = _current_user(request)
+    note = (payload.note if payload else "").strip()
+    transition(db, task, "queued", actor=user, reason=f"approved for execution: {note}".strip())
+    log_action(db, task, "approved_for_execution", actor=user, to_status="queued", reason=note or "human approved start")
+    db.commit()
+    return serialize_task(db, task)
+
+
 @router.post("/tasks/{task_id}/unblock")
 def unblock_task(task_id: str, request: Request, db: Session = Depends(get_session)) -> dict:
     task = db.query(Task).filter(Task.id == task_id).first()
@@ -270,7 +302,12 @@ def review_queue(db: Session = Depends(get_session)) -> list[dict]:
 @router.get("/capabilities")
 def capabilities() -> list[dict]:
     adapter = get_adapter(settings.adapter)
-    pool = ["default", "sim", "research", "build"] if adapter.name == "simulated" else ["default"]
+    if adapter.name == "simulated":
+        pool = ["default", "sim", "research", "build"]
+    elif adapter.name == "opencode":
+        pool = ["default", "build", "research"]
+    else:
+        pool = ["default"]
     return [{"name": c, "adapter": adapter.name} for c in pool]
 
 

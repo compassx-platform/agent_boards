@@ -61,9 +61,10 @@ class SimulatedAgent(AgentAdapter):
         if not entry:
             return ExecutionStatus(running=False, state="finished", detail="unknown execution_id")
         _, finish_at, _, _, _, _, _ = entry
+        session = {"provider": self.name, "session_id": execution_id, "link": ""}
         if time.monotonic() >= finish_at:
-            return ExecutionStatus(running=False, state="finished", detail="output ready")
-        return ExecutionStatus(running=True, state="running", detail="working…")
+            return ExecutionStatus(running=False, state="finished", detail="output ready", session=session)
+        return ExecutionStatus(running=True, state="running", detail="working…", session=session)
 
     async def get_result(self, execution_id: str) -> ExecutionResult:
         entry = self._runs.pop(execution_id, None)
@@ -124,6 +125,9 @@ class SimulatedAgent(AgentAdapter):
             tools_used=["read_context", "reason", "write_artifact"],
             logs_ref=str(run_log),
             success=not fail,
+            session_id=execution_id,
+            provider=self.name,
+            session_link="",
         )
 
     async def cancel(self, execution_id: str) -> bool:

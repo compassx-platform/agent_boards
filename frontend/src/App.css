@@ -543,3 +543,7 @@ select[multiple] {
 .review-panel {
   border-color: var(--warn);
 }
+/* sessions */
+.session { border-bottom: 1px solid #2c2c2e; padding: 6px 0; }
+.session-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.session-id { font-size: 12px; overflow-wrap: anywhere; }
