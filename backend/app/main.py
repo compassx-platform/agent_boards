@@ -191,9 +191,19 @@ async def proxy_omnigent_v1(request: Request, path: str):
     )
 
 
+from pathlib import Path
+from fastapi.responses import FileResponse
+
+FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+
 @app.api_route("/assets/{path:path}", methods=["GET"])
 async def proxy_omnigent_assets(path: str):
-    """Proxy official frontend JS/CSS assets from Omnigent server."""
+    """Serve local frontend JS/CSS assets if present, otherwise proxy from Omnigent server."""
+    local_file = FRONTEND_DIST / "assets" / path
+    if local_file.is_file():
+        return FileResponse(local_file)
+
     url = f"{settings.omnigent_api_url}/assets/{path}"
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(url)
@@ -267,6 +277,23 @@ async def proxy_omnigent_app(path: str = ""):
     )
 
 
+@app.get("/board")
+@app.get("/new")
+@app.get("/reviews")
+@app.get("/sessions")
+@app.get("/sessions/{path:path}")
+@app.get("/settings")
+@app.get("/tasks/{path:path}")
+async def serve_frontend_spa_routes():
+    index_file = FRONTEND_DIST / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
+    return {"message": f"{settings.app_name} API"}
+
+
 @app.get("/")
-def root() -> dict[str, str]:
+def root():
+    index_file = FRONTEND_DIST / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
     return {"message": f"{settings.app_name} API — see /docs"}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   Task,
   TaskCreateInput,
@@ -1144,21 +1144,143 @@ function TaskDetail({
   )
 }
 
+type View = 'board' | 'new' | 'reviews' | 'settings' | 'sessions'
+
+interface RouteState {
+  view: View
+  selectedTask: string | null
+  sessionFocus: string | null
+}
+
+function parseLocation(): RouteState {
+  if (typeof window === 'undefined') {
+    return { view: 'board', selectedTask: null, sessionFocus: null }
+  }
+
+  const path = window.location.pathname.replace(/\/+$/, '') || '/'
+  const hash = window.location.hash.replace(/^#\/?/, '').replace(/\/+$/, '')
+  const params = new URLSearchParams(window.location.search)
+  const taskParam = params.get('task') || params.get('id') || null
+  const focusParam = params.get('focus') || params.get('session') || null
+
+  const effective = (path !== '/' ? path : hash ? `/${hash}` : '/').toLowerCase()
+
+  // 1. Task detail direct path: /tasks/:id or /task/:id
+  const taskMatch = effective.match(/^\/(?:tasks?)\/([a-zA-Z0-9_-]+)/)
+  if (taskMatch && taskMatch[1] !== 'new') {
+    return {
+      view: 'board',
+      selectedTask: taskMatch[1],
+      sessionFocus: focusParam,
+    }
+  }
+
+  // 2. New task: /new or /tasks/new
+  if (effective === '/new' || effective === '/tasks/new') {
+    return { view: 'new', selectedTask: null, sessionFocus: null }
+  }
+
+  // 3. Reviews: /reviews
+  if (effective === '/reviews') {
+    return {
+      view: 'reviews',
+      selectedTask: taskParam,
+      sessionFocus: null,
+    }
+  }
+
+  // 4. Sessions: /sessions or /sessions/:id or /c/:id
+  const sessionsMatch = effective.match(/^\/sessions(?:\/([a-zA-Z0-9_-]+))?/)
+  if (sessionsMatch || effective.startsWith('/c/')) {
+    const directSessionId =
+      sessionsMatch?.[1] || (effective.startsWith('/c/') ? effective.split('/')[2] : null)
+    return {
+      view: 'sessions',
+      selectedTask: null,
+      sessionFocus: directSessionId || focusParam,
+    }
+  }
+
+  // 5. Settings: /settings
+  if (effective === '/settings') {
+    return { view: 'settings', selectedTask: null, sessionFocus: null }
+  }
+
+  // 6. Default: Board
+  return {
+    view: 'board',
+    selectedTask: taskParam,
+    sessionFocus: focusParam,
+  }
+}
+
+function buildUrl(view: View, selectedTask: string | null, sessionFocus: string | null): string {
+  if (selectedTask) {
+    if (view === 'reviews') {
+      return `/reviews?task=${encodeURIComponent(selectedTask)}`
+    }
+    return `/tasks/${encodeURIComponent(selectedTask)}`
+  }
+
+  switch (view) {
+    case 'new':
+      return '/new'
+    case 'reviews':
+      return '/reviews'
+    case 'sessions':
+      return sessionFocus ? `/sessions/${encodeURIComponent(sessionFocus)}` : '/sessions'
+    case 'settings':
+      return '/settings'
+    case 'board':
+    default:
+      return '/board'
+  }
+}
+
 // -------------------------------------------------------------------------- app
 export default function App() {
   const { tasks, metrics, caps, harnessData, error, refresh } = useTaskStore()
-  const [view, setView] = useState<'board' | 'new' | 'reviews' | 'settings' | 'sessions'>('board')
-  const [selected, setSelected] = useState<string | null>(null)
-  const [sessionFocus, setSessionFocus] = useState<string | null>(null)
+  const initialRoute = useMemo(() => parseLocation(), [])
+  const [view, setView] = useState<View>(initialRoute.view)
+  const [selected, setSelected] = useState<string | null>(initialRoute.selectedTask)
+  const [sessionFocus, setSessionFocus] = useState<string | null>(initialRoute.sessionFocus)
+  const isPopStateRef = useRef(false)
 
+  // Synchronize state changes to browser URL
   useEffect(() => {
-    setSelected(null)
-  }, [view])
+    if (isPopStateRef.current) {
+      isPopStateRef.current = false
+      return
+    }
+    const targetUrl = buildUrl(view, selected, sessionFocus)
+    const currentUrl = window.location.pathname + window.location.search
+    if (currentUrl !== targetUrl && (currentUrl !== '/' || targetUrl !== '/board')) {
+      window.history.pushState({ view, selected, sessionFocus }, '', targetUrl)
+    }
+  }, [view, selected, sessionFocus])
+
+  // Synchronize browser history (Back/Forward buttons) to state
+  useEffect(() => {
+    const handlePopState = () => {
+      const loc = parseLocation()
+      isPopStateRef.current = true
+      setView(loc.view)
+      setSelected(loc.selectedTask)
+      setSessionFocus(loc.sessionFocus)
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  const navigateTo = (newView: View, newSelected: string | null = null, newFocus: string | null = null) => {
+    setView(newView)
+    setSelected(newSelected)
+    setSessionFocus(newFocus)
+  }
 
   const openSession = (sessionId: string) => {
-    setView('sessions')
-    setSessionFocus(sessionId)
-    setSelected(null)
+    navigateTo('sessions', null, sessionId)
   }
 
   const reviewCount = tasks.filter((t) => t.status === 'needs_review').length
@@ -1174,19 +1296,19 @@ export default function App() {
           ⚙ {adapter}
         </span>
         <nav>
-          <button className={view === 'board' ? 'active' : ''} onClick={() => setView('board')}>
+          <button className={view === 'board' ? 'active' : ''} onClick={() => navigateTo('board')}>
             Board
           </button>
-          <button className={view === 'new' ? 'active' : ''} onClick={() => setView('new')}>
+          <button className={view === 'new' ? 'active' : ''} onClick={() => navigateTo('new')}>
             New task
           </button>
-          <button className={view === 'reviews' ? 'active' : ''} onClick={() => setView('reviews')}>
+          <button className={view === 'reviews' ? 'active' : ''} onClick={() => navigateTo('reviews')}>
             Reviews {reviewCount > 0 ? <span className="badge">{reviewCount}</span> : null}
           </button>
-          <button className={view === 'sessions' ? 'active' : ''} onClick={() => setView('sessions')}>
+          <button className={view === 'sessions' ? 'active' : ''} onClick={() => navigateTo('sessions', null, sessionFocus)}>
             Sessions
           </button>
-          <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>
+          <button className={view === 'settings' ? 'active' : ''} onClick={() => navigateTo('settings')}>
             Settings
           </button>
         </nav>
@@ -1210,11 +1332,11 @@ export default function App() {
 
       <main className="content">
         {view === 'board' ? (
-          <Board tasks={tasks} onClick={setSelected} />
+          <Board tasks={tasks} onClick={(id) => setSelected(id)} />
         ) : view === 'new' ? (
           <NewTaskForm tasks={tasks} caps={caps} harnessData={harnessData} refresh={refresh} onCreated={(id) => setSelected(id)} />
         ) : view === 'reviews' ? (
-          <Reviews refresh={refresh} onOpen={setSelected} />
+          <Reviews refresh={refresh} onOpen={(id) => setSelected(id)} />
         ) : view === 'sessions' ? (
           <SessionsPage focus={sessionFocus} />
         ) : (
