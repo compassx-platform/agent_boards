@@ -55,9 +55,21 @@ def ensure_columns() -> None:
         "host_id": "host_id VARCHAR(64)",
         "host_name": "host_name VARCHAR(255)",
         "dev_url": "dev_url TEXT",
+        "provisioning_steps": "provisioning_steps TEXT",
+        "session_id": "session_id VARCHAR(128)",
+        "bypass_verification": "bypass_verification BOOLEAN DEFAULT 1",
+        "verification_bypass_outcome": "verification_bypass_outcome VARCHAR(32) DEFAULT 'needs_review'",
     }
     missing = [stmt for name, stmt in additions.items() if name not in existing]
     if missing:
         with engine.begin() as conn:
             for stmt in missing:
                 conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {stmt}"))
+
+    # execution_sessions: "archived" flag — a session stops being the task's
+    # single active session when archived (never deleted), and a new active
+    # session is only created once none is left.
+    ses_existing = {c["name"] for c in inspect(engine).get_columns("execution_sessions")}
+    if "archived" not in ses_existing:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE execution_sessions ADD COLUMN archived BOOLEAN DEFAULT 0 NOT NULL"))

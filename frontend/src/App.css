@@ -267,6 +267,57 @@ textarea:focus {
   font-size: 13px;
   white-space: nowrap;
 }
+.provision-steps {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.provision-steps h4 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+.provision-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  padding: 3px 0;
+}
+.provision-step .ps-icon {
+  width: 16px;
+  text-align: center;
+  font-weight: 700;
+  flex: none;
+}
+.provision-step .ps-label {
+  font-weight: 600;
+}
+.provision-step .ps-detail {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  word-break: break-word;
+}
+.provision-step .ps-time {
+  color: var(--text-dim);
+  font-size: 11px;
+  flex: none;
+}
+.ps-pending .ps-icon { color: var(--text-dim); }
+.ps-pending .ps-label { color: var(--text-dim); }
+.ps-running { color: var(--accent); }
+.ps-running .ps-icon { animation: ps-spin 1.2s linear infinite; display: inline-block; }
+.ps-done .ps-icon { color: #30d158; }
+.ps-done .ps-label { color: #30d158; }
+.ps-failed .ps-icon { color: #ff453a; }
+.ps-failed .ps-label { color: #ff453a; }
+@keyframes ps-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 .warn {
   color: var(--warn);
 }
@@ -315,6 +366,14 @@ textarea:focus {
 .r-low {
   color: #30d158;
   border-color: #30d15855;
+}
+.active-chip {
+  color: #30d158;
+  border-color: #30d15855;
+}
+.muted-chip {
+  color: #8e8e93;
+  border-color: #8e8e9355;
 }
 .status-big {
   font-size: 13px;
@@ -625,3 +684,14 @@ select[multiple] {
 .session { border-bottom: 1px solid #2c2c2e; padding: 6px 0; }
 .session-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .session-id { font-size: 12px; overflow-wrap: anywhere; }
+
+/* settings */
+.settings-panel { display: flex; flex-direction: column; gap: 14px; }
+.setting-row { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; padding-bottom: 14px; border-bottom: 1px solid #2c2c2e; }
+.setting-row:last-of-type { border-bottom: none; padding-bottom: 0; }
+.setting-meta { flex: 1; max-width: 480px; }
+.setting-meta p { margin: 4px 0 0; font-size: 12px; }
+.setting-input { display: flex; align-items: center; gap: 8px; }
+.setting-input input { width: 130px; text-align: right; }
+.settings-actions { justify-content: flex-end; margin-top: 4px; }
+.banner-error { color: #ff453a; font-size: 13px; padding: 4px 0; }

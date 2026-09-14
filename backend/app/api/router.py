@@ -16,9 +16,10 @@ from app.compassx import compassx
 from app.config import CHECK_TYPES, PRIORITIES, RISK_RULES, RISK_TIERS, settings
 from app.db import get_session
 from app.events import bus
-from app.models import AuditLog, Attempt, ContextRef, Criterion, Task, TaskDependency
+from app.models import AuditLog, Attempt, ContextRef, Criterion, ExecutionSession, Task, TaskDependency
 from app.orchestrator import orchestrator
 from app.serialization import serialize_task
+from app import settings_service
 from app.state_machine import transition
 
 router = APIRouter(prefix="", tags=["taskexec"])
@@ -43,6 +44,10 @@ class CriterionIn(BaseModel):
         return v
 
 
+class SettingsIn(BaseModel):
+    settings: dict[str, object] = {}
+
+
 class TaskCreate(BaseModel):
     title: str
     intent: str = ""
@@ -51,6 +56,8 @@ class TaskCreate(BaseModel):
     agent_capability: str = "default"
     max_attempts: int | None = None
     plan_required: bool = False
+    bypass_verification: bool = True
+    verification_bypass_outcome: str = "needs_review"
     workspace: str | None = None
     harness: str | None = None
     compassx_app_id: str | None = None
@@ -72,6 +79,13 @@ class TaskCreate(BaseModel):
     def risk_valid(cls, v: str) -> str:
         if v not in RISK_TIERS:
             raise ValueError(f"risk_tier must be one of {RISK_TIERS}")
+        return v
+
+    @field_validator("verification_bypass_outcome")
+    @classmethod
+    def bypass_outcome_valid(cls, v: str) -> str:
+        if v not in {"done", "needs_review"}:
+            raise ValueError("verification_bypass_outcome must be 'done' or 'needs_review'")
         return v
 
 
@@ -115,6 +129,8 @@ def _build_task(db: Session, payload: TaskCreate, user: str) -> Task:
         status="backlog",
         plan_required=payload.plan_required,
         plan_status="none",
+        bypass_verification=payload.bypass_verification,
+        verification_bypass_outcome=payload.verification_bypass_outcome,
         workspace=(payload.workspace or "").strip() or None,
         harness=(payload.harness or "").strip() or settings.omnigent_default_harness,
         compassx_app_id=(payload.compassx_app_id or "").strip() or None,
@@ -297,6 +313,74 @@ def unblock_task(task_id: str, request: Request, db: Session = Depends(get_sessi
     task.not_before = None
     task.escalation_reason = None
     transition(db, task, "queued", actor=_current_user(request), reason="manually unblocked")
+    db.commit()
+    return serialize_task(db, task)
+
+
+@router.post("/tasks/{task_id}/new_session")
+def new_session(
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+) -> dict:
+    """Start a brand-new agent session for the task.
+
+    The task owns exactly one ACTIVE agent session (persisted as
+    task.session_id) reused over every attempt/retry. "New session" ARCHIVES the
+    current active session (a flag — never deleted, always visible in history)
+    and drops the task's active handle, so the next dispatch creates a fresh
+    session only because none is active anymore. At most one active session
+    exists per task at any time.
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    old_session = task.session_id
+    user = _current_user(request)
+
+    # Archive the task's currently active session(s) — flag only, never delete.
+    archived: list[str] = []
+    for srow in (
+        db.query(ExecutionSession)
+        .filter(
+            ExecutionSession.task_id == task_id,
+            ExecutionSession.archived.is_(False),
+        )
+        .all()
+    ):
+        if old_session and srow.session_id == old_session:
+            if srow.status in {"running", None}:
+                srow.status = "finished"
+        srow.archived = True
+        archived.append(srow.session_id)
+    if old_session and old_session != task_id and old_session not in archived:
+        # The active session was created (provisioning) but never polled into an
+        # ExecutionSession row yet — record it so the archive isn't lost.
+        db.add(
+            ExecutionSession(
+                task_id=task_id,
+                provider="omnigent",
+                session_id=old_session,
+                link=f"{settings.omnigent_api_url}/sessions/{old_session}",
+                status="finished",
+                archived=True,
+            )
+        )
+        archived.append(old_session)
+
+    task.session_id = None
+    task.current_attempt = 0
+    task.not_before = None
+    task.escalation_reason = None
+    if task.status in {"blocked", "rejected", "needs_review"}:
+        transition(
+            db, task, "queued", actor=user,
+            reason=f"new session requested (archived {old_session or '(none)'})",
+        )
+    log_action(
+        db, task, "archive_session", actor=user, to_status=task.status,
+        reason=f"archived active session {old_session or '(none)'}; next dispatch creates a fresh active session",
+    )
     db.commit()
     return serialize_task(db, task)
 
@@ -516,10 +600,30 @@ def parse_intent(payload: ParseRequest) -> dict:
     }
 
 
+@router.get("/settings")
+def get_settings(db: Session = Depends(get_session)) -> dict:
+    return {
+        "settings": settings_service.get_settings(db),
+        "definitions": settings_service.definitions(),
+    }
+
+
+@router.put("/settings")
+def update_settings(payload: SettingsIn, db: Session = Depends(get_session)) -> dict:
+    try:
+        updated = settings_service.update_settings(db, dict(payload.settings or {}))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {
+        "settings": updated,
+        "definitions": settings_service.definitions(),
+    }
+
+
 @router.get("/metrics")
 def metrics(db: Session = Depends(get_session)) -> dict:
     counts: dict[str, int] = {s: db.query(Task).filter(Task.status == s).count() for s in [
-        "backlog", "queued", "executing", "verifying", "needs_review", "done", "rejected", "blocked"
+        "backlog", "queued", "host_provisioning", "executing", "verifying", "needs_review", "done", "rejected", "blocked"
     ]}
     escalations = db.query(AuditLog).filter(AuditLog.action == "escalation").count()
     attempts = db.query(Attempt).filter(Attempt.verification_result != None).all()  # noqa: E711

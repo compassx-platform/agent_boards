@@ -1,6 +1,7 @@
 export type Status =
   | 'backlog'
   | 'queued'
+  | 'host_provisioning'
   | 'executing'
   | 'verifying'
   | 'needs_review'
@@ -65,6 +66,7 @@ export interface TaskSession {
   session_id: string
   link: string | null
   status: string | null
+  archived: boolean
   created_at: string
 }
 
@@ -97,12 +99,15 @@ export interface Task {
   host_id: string | null
   host_name: string | null
   dev_url: string | null
+  provisioning_steps: ProvisionStep[]
   current_attempt: number
   max_attempts: number
   escalation_reason: string | null
   plan_required: boolean
   plan_status: PlanStatus
   plan_text: string | null
+  bypass_verification: boolean
+  verification_bypass_outcome: string
   pr_url: string | null
   session_id: string | null
   session_link: string | null
@@ -132,6 +137,8 @@ export interface TaskCreateInput {
   agent_capability: string
   max_attempts?: number
   plan_required?: boolean
+  bypass_verification?: boolean
+  verification_bypass_outcome?: string
   workspace?: string
   harness?: string
   compassx_app_id?: string
@@ -152,6 +159,23 @@ export interface HarnessesResponse {
   default: string
   adapter: string
   source: string
+}
+
+export type SettingDefType = 'string' | 'number' | 'bool'
+
+export interface SettingDef {
+  label: string
+  type: SettingDefType
+  min?: number
+  max?: number
+  step?: number
+  options?: string[]
+  description?: string
+}
+
+export interface SettingsResponse {
+  settings: Record<string, unknown>
+  definitions: Record<string, SettingDef>
 }
 
 export interface CompassXApp {
@@ -193,6 +217,23 @@ export interface CompassXDevStatusResponse {
   error?: string | null
 }
 
+export type ProvisionStepStatus = 'pending' | 'running' | 'done' | 'failed'
+
+export interface ProvisionStep {
+  name: string
+  status: ProvisionStepStatus
+  detail: string
+  updated_at: string
+}
+
+export const PROVISION_STEP_LABELS: Record<string, string> = {
+  resolve_workspace: 'Resolve dev workspace',
+  start_dev: 'Start dev sandbox',
+  wait_host_ready: 'Wait for dev host online',
+  verify_omnigent: 'Verify host on Omnigent',
+  create_session: 'Create agent session',
+}
+
 export const DEFAULT_HARNESS = 'opencode-native'
 
 const BASE = '/api/v1'
@@ -228,6 +269,7 @@ export const api = {
       body: JSON.stringify({ action, note }),
     }),
   unblock: (id: string) => http<Task>(`/tasks/${id}/unblock`, { method: 'POST' }),
+  newSession: (id: string) => http<Task>(`/tasks/${id}/new_session`, { method: 'POST' }),
   approveExecution: (id: string, note: string) =>
     http<Task>(`/tasks/${id}/approve_execution`, {
       method: 'POST',
@@ -238,6 +280,12 @@ export const api = {
   capabilities: () =>
     http<{ name: string; adapter: string }[]>('/capabilities'),
   harnesses: () => http<HarnessesResponse>('/harnesses'),
+  settings: () => http<SettingsResponse>('/settings'),
+  updateSettings: (settings: Record<string, unknown>) =>
+    http<SettingsResponse>('/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ settings }),
+    }),
   compassxApps: () => http<CompassXAppsResponse>('/compassx/apps'),
   compassxWorkspaces: (appId: string) =>
     http<CompassXWorkspacesResponse>(`/compassx/apps/${appId}/dev/workspaces`),
@@ -272,6 +320,7 @@ export async function readStream(onEvent: (event: { type: string; task?: Task })
 export const STATUS_META: Record<Status, { label: string; color: string }> = {
   backlog: { label: 'Backlog', color: '#8e8e93' },
   queued: { label: 'Queued', color: '#5e9ce6' },
+  host_provisioning: { label: 'Provisioning Host', color: '#ff9f0a' },
   executing: { label: 'Executing', color: '#0a84ff' },
   verifying: { label: 'Verifying', color: '#bf5af2' },
   needs_review: { label: 'Needs Review', color: '#ff9f0a' },
@@ -283,6 +332,7 @@ export const STATUS_META: Record<Status, { label: string; color: string }> = {
 export const BOARD_COLUMNS: Status[] = [
   'backlog',
   'queued',
+  'host_provisioning',
   'executing',
   'verifying',
   'needs_review',

@@ -13,8 +13,9 @@ from app.config import RISK_RULES, settings
 from app.db import SessionLocal
 from app.events import bus
 from app.models import Attempt, ExecutionSession, Task
-from app.provisioning import provisioner
+from app.provisioning import initial_provision_steps, provisioner
 from app.serialization import task_event
+from app.settings_service import get_poll_interval_seconds
 from app.state_machine import transition, utcnow
 from app.verification import verify_attempt
 
@@ -45,6 +46,9 @@ class Orchestrator:
     def __init__(self) -> None:
         self.adapter = get_adapter(settings.adapter)
         self._running: dict[str, dict] = {}  # task_id -> {execution_id, phase}
+        # task_id -> provisioning in flight (host_provisioning stage):
+        #   {session_id, phase, checks, next_check_at, last_error}
+        self._provisioning: dict[str, dict] = {}
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -67,7 +71,7 @@ class Orchestrator:
                 await self._tick()
             except Exception:
                 logger.exception("orchestrator tick failed")
-            await asyncio.sleep(settings.poll_interval_seconds)
+            await asyncio.sleep(get_poll_interval_seconds())
 
     async def _tick(self) -> None:
         db = SessionLocal()
@@ -78,6 +82,7 @@ class Orchestrator:
             # /tasks/{id}/approve_execution). In-flight attempts are resumed by
             # _start_available, which only looks at queued/executing.
             await self._start_available(db, changed)
+            await self._poll_provisioning(db, changed)
             await self._poll_running(db, changed)
             db.commit()
             for task_id in changed:
@@ -104,23 +109,215 @@ class Orchestrator:
             .all()
         )
         candidates.sort(key=lambda t: (-PRIORITY_RANK.get(t.priority, 1), t.created_at or now))
-        capacity = max(0, settings.agent_capacity - len(self._running))
+        capacity = max(0, settings.agent_capacity - len(self._running) - len(self._provisioning))
         started = 0
         for task in candidates:
             if started >= capacity:
                 break
-            if task.id in self._running or self._phase_for(task) is None:
+            if task.id in self._running or task.id in self._provisioning or self._phase_for(task) is None:
                 continue
             if task.not_before and task.not_before > now:
                 continue
             if task.status == "queued":
+                if self.adapter.needs_provisioning(task):
+                    transition(
+                        db, task, "host_provisioning", actor="orchestrator",
+                        reason="queued → bringing execution host to readiness",
+                    )
+                    task.provisioning_steps = json.dumps(initial_provision_steps())
+                    db.commit()
+                    self._provisioning[task.id] = {
+                        "session_id": None,
+                        "phase": self._phase_for(task) or "execute",
+                        "checks": 0,
+                        "next_check_at": None,  # first check fires immediately
+                        "last_error": None,
+                    }
+                    changed.add(task.id)
+                    continue
                 transition(db, task, "executing", actor="orchestrator", reason="queued → assigned to agent")
                 changed.add(task.id)
             if not await self._start_attempt(db, task, changed):
                 continue
             started += 1
 
-    async def _start_attempt(self, db: Session, task: Task, changed: set[str]) -> bool:
+    async def _poll_provisioning(self, db: Session, changed: set[str]) -> None:
+        """Escalating-timer host readiness checks for the host_provisioning stage.
+
+        The first check fires immediately (on entry), then every failed check
+        doubles the delay (10s, 20s, 40s, … capped) per settings, so a slow
+        CompassX host bring-up never burns attempt budget. When the host is
+        ready the task moves to executing and its first attempt reuses the
+        already-created session.
+        """
+        for task_id in list(self._provisioning.keys()):
+            entry = self._provisioning[task_id]
+            now = asyncio.get_running_loop().time()
+            if entry["next_check_at"] and now < entry["next_check_at"]:
+                continue
+            entry["next_check_at"] = None  # check in flight
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task or task.status != "host_provisioning":
+                self._provisioning.pop(task_id, None)
+                continue
+            if entry["checks"] >= settings.host_provisioning_max_checks:
+                reason = (
+                    "host not ready after "
+                    f"{entry['checks']} provisioning checks: "
+                    f"{entry['last_error'] or 'host still unavailable'}"
+                )
+                task.escalation_reason = reason
+                transition(db, task, "blocked", actor="orchestrator", reason=reason)
+                log_action(db, task, "blocked", actor="orchestrator", to_status="blocked", reason=reason)
+                changed.add(task.id)
+                self._provisioning.pop(task_id, None)
+                continue
+            if await self._provision_host(db, task, entry, changed):
+                self._provisioning.pop(task_id, None)
+                continue
+            entry["checks"] += 1
+            delay = min(
+                settings.host_provisioning_first_check_seconds * (2 ** (entry["checks"] - 1)),
+                settings.host_provisioning_max_check_seconds,
+            )
+            entry["next_check_at"] = now + delay
+            logger.warning(
+                "task %s host not ready (check %d/%d); next check in %.0fs",
+                task.id, entry["checks"], settings.host_provisioning_max_checks, delay,
+            )
+
+    async def _provision_host(self, db: Session, task: Task, entry: dict, changed: set[str]) -> bool:
+        """One readiness probe. Returns True once the host is ready and the first
+        attempt has been started (task moved to executing)."""
+        if not entry["session_id"]:
+            if task.session_id:
+                # The task already owns an agent session (created on the first
+                # attempt or by the user's explicit "new session" click). Never
+                # double-create: reuse it for every subsequent attempt.
+                entry["session_id"] = task.session_id
+                await self._record_step(
+                    db, task, "create_session", "done",
+                    f"reusing session {task.session_id}",
+                )
+                entry["last_error"] = None
+                return await self._finish_provisioning(db, task, entry, changed)
+            try:
+                host = await provisioner.ensure_host(
+                    task, record=self._step_recorder(db, task)
+                )
+                self._persist_host(db, task, host)
+            except Exception as exc:  # host still coming up / transient
+                entry["last_error"] = str(exc)
+                logger.warning(
+                    "task %s host provisioning probe failed: %s",
+                    task.id, exc,
+                )
+                return False
+            await self._record_step(
+                db, task, "create_session", "running",
+                "creating agent session on the Omnigent server",
+            )
+            try:
+                session_id = await self.adapter.provision(task, entry["phase"])
+            except Exception as exc:
+                entry["last_error"] = str(exc)
+                await self._record_step(db, task, "create_session", "failed", str(exc)[:200])
+                logger.warning(
+                    "task %s session provisioning failed: %s",
+                    task.id, exc,
+                )
+                return False
+            if not session_id:
+                entry["last_error"] = "workspace path not ready yet"
+                return False
+            entry["session_id"] = session_id
+            task.session_id = session_id
+            db.commit()
+            await self._record_step(
+                db, task, "create_session", "done", f"session {session_id} created",
+            )
+            entry["last_error"] = None
+            return await self._finish_provisioning(db, task, entry, changed)
+        return await self._finish_provisioning(db, task, entry, changed)
+
+    async def _finish_provisioning(self, db: Session, task: Task, entry: dict, changed: set[str]) -> bool:
+        """Host is ready: persist the session, move to executing, start the attempt."""
+        transition(db, task, "executing", actor="orchestrator", reason="host ready — starting execution")
+        db.commit()
+        log_action(
+            db, task, "host_ready", actor="orchestrator", to_status="executing",
+            reason=(
+                f"execution host ready; reusing session {entry['session_id']} "
+                f"on host {task.host_id} ({task.host_name or '?'})"
+            ),
+        )
+        changed.add(task.id)
+        await self._start_attempt(db, task, changed, session_id=entry["session_id"], host_ready=True)
+        return True
+
+    @staticmethod
+    def _persist_host(db: Session, task: Task, host: dict) -> None:
+        task.host_id = host.get("host_id") or task.host_id
+        task.host_name = host.get("host_name") or task.host_name
+        task.compassx_workspace_id = host.get("workspace_id") or task.compassx_workspace_id
+        if host.get("workspace_name"):
+            task.compassx_workspace_name = host["workspace_name"]
+        if host.get("workspace"):
+            task.workspace = host["workspace"]
+        if host.get("dev_url"):
+            task.dev_url = host["dev_url"]
+
+    # ----------------------------------------------------- provisioning steps
+
+    @staticmethod
+    def _load_steps(task: Task) -> list[dict]:
+        raw = task.provisioning_steps or ""
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    async def _record_step(
+        self, db: Session, task: Task, name: str, status: str, detail: str
+    ) -> None:
+        """Persist one provisioning-step update on the task and push it to the
+        UI (SSE) so the checklist updates live during host bring-up."""
+        steps = self._load_steps(task)
+        entry = next((s for s in steps if s.get("name") == name), None)
+        stamp = utcnow().isoformat()
+        if entry is None:
+            steps.append(
+                {"name": name, "status": status, "detail": detail or "", "updated_at": stamp}
+            )
+        else:
+            entry["status"] = status
+            if detail:
+                entry["detail"] = detail
+            entry["updated_at"] = stamp
+        task.provisioning_steps = json.dumps(steps)
+        db.commit()
+        await bus.publish(task_event(task, db))
+
+    def _step_recorder(self, db: Session, task: Task):
+        """Bound record callback handed to the provisioner's ensure_host."""
+
+        async def record(name: str, status: str, detail: str) -> None:
+            await self._record_step(db, task, name, status, detail)
+
+        return record
+
+    async def _start_attempt(
+        self,
+        db: Session,
+        task: Task,
+        changed: set[str],
+        *,
+        session_id: str | None = None,
+        host_ready: bool = False,
+    ) -> bool:
         phase = self._phase_for(task) or "execute"
         if phase == "plan" and task.plan_status != "planning":
             task.plan_status = "planning"
@@ -139,17 +336,9 @@ class Orchestrator:
         db.add(attempt)
         db.commit()
         try:
-            if (task.compassx_app_id or "").strip():
-                host = await provisioner.ensure_host(task)
-                task.host_id = host.get("host_id") or task.host_id
-                task.host_name = host.get("host_name") or task.host_name
-                task.compassx_workspace_id = host.get("workspace_id") or task.compassx_workspace_id
-                if host.get("workspace_name"):
-                    task.compassx_workspace_name = host["workspace_name"]
-                if host.get("workspace"):
-                    task.workspace = host["workspace"]
-                if host.get("dev_url"):
-                    task.dev_url = host["dev_url"]
+            if (task.compassx_app_id or "").strip() and not host_ready:
+                host = await provisioner.ensure_host(task, record=self._step_recorder(db, task))
+                self._persist_host(db, task, host)
                 db.commit()
                 log_action(
                     db,
@@ -163,8 +352,11 @@ class Orchestrator:
                     ),
                 )
                 db.commit()
+            if session_id is None:
+                session_id = task.session_id or None
             execution_id = await self.adapter.submit(
-                task, task.current_attempt, attempt.id, str(artifacts_dir), phase
+                task, task.current_attempt, attempt.id, str(artifacts_dir), phase,
+                session_id=session_id,
             )
         except Exception as exc:
             attempt.status = "failed"
@@ -188,6 +380,10 @@ class Orchestrator:
             logger.exception("adapter submit failed for task %s", task.id)
             return False
         attempt.execution_id = execution_id or attempt.id
+        if execution_id and not task.session_id:
+            # The adapter created the session internally (non-provisioned path or
+            # a fallback). Own it on the task so every later attempt reuses it.
+            task.session_id = execution_id
         db.commit()
         self._running[task.id] = {"execution_id": execution_id, "phase": phase}
         changed.add(task.id)
@@ -217,6 +413,19 @@ class Orchestrator:
             row.status = status
             row.updated_at = utcnow()
         else:
+            # New active session: archive every other still-active session so the
+            # task keeps exactly one active session at a time (old ones are kept,
+            # flagged, never deleted).
+            for stale in (
+                db.query(ExecutionSession)
+                .filter(
+                    ExecutionSession.task_id == task_id,
+                    ExecutionSession.archived.is_(False),
+                )
+                .all()
+            ):
+                stale.archived = True
+                stale.updated_at = utcnow()
             db.add(
                 ExecutionSession(
                     task_id=task_id,
@@ -310,42 +519,66 @@ class Orchestrator:
         transition(db, task, "verifying", actor="orchestrator", reason="agent output ready")
         db.flush()
 
-        verdict = await verify_attempt(db, attempt, task.criteria)
-        attempt.verification_result = (
-            verdict.verdict if verdict.verdict != "requires_review" else "pending"
-        )
-        attempt.verification_details = verdict.details
-        if verdict.failure_reason:
-            attempt.failure_reason = verdict.failure_reason
-        db.commit()
-
-        if not result.success:
-            reason = "agent execution failed: " + (attempt.failure_reason or "unknown error")
-            await self._handle_failure(db, task, reason, max_attempts, changed)
-        elif verdict.verdict == "requires_review":
-            task.escalation_reason = verdict.failure_reason or "requires reviewer"
-            transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
-            log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
-        elif verdict.verdict == "pass":
-            if not auto_approve:
-                task.escalation_reason = "Risk tier requires human sign-off"
-                transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
-                log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
-            else:
+        verdict = None
+        if task.bypass_verification:
+            # Verification bypass: skip the definition-of-done criteria entirely
+            # and route the finished execution straight to the configured
+            # outcome (needs_review by default, done if opted in).
+            attempt.verification_result = "bypassed"
+            attempt.verification_details = (
+                f"verification bypassed; routed to {task.verification_bypass_outcome}"
+            )
+            db.commit()
+            if not result.success:
+                reason = "agent execution failed: " + (attempt.failure_reason or "unknown error")
+                await self._handle_failure(db, task, reason, max_attempts, changed)
+            elif task.verification_bypass_outcome == "done":
                 task.escalation_reason = None
                 if task.plan_required:
                     task.plan_status = "done"
-                transition(db, task, "done", actor="orchestrator", reason="all criteria passed, auto-approved")
+                transition(db, task, "done", actor="orchestrator", reason="verification bypassed")
                 await self._publish_changes(db, task)
+            else:
+                task.escalation_reason = "Verification bypassed — requires review"
+                transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
+                log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
         else:
-            await self._handle_failure(db, task, verdict.failure_reason or "verification failed", max_attempts, changed)
+            verdict = await verify_attempt(db, attempt, task.criteria)
+            attempt.verification_result = (
+                verdict.verdict if verdict.verdict != "requires_review" else "pending"
+            )
+            attempt.verification_details = verdict.details
+            if verdict.failure_reason:
+                attempt.failure_reason = verdict.failure_reason
+            db.commit()
+
+            if not result.success:
+                reason = "agent execution failed: " + (attempt.failure_reason or "unknown error")
+                await self._handle_failure(db, task, reason, max_attempts, changed)
+            elif verdict.verdict == "requires_review":
+                task.escalation_reason = verdict.failure_reason or "requires reviewer"
+                transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
+                log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
+            elif verdict.verdict == "pass":
+                if not auto_approve:
+                    task.escalation_reason = "Risk tier requires human sign-off"
+                    transition(db, task, "needs_review", actor="orchestrator", reason=task.escalation_reason)
+                    log_action(db, task, "escalation", actor="orchestrator", to_status="needs_review", reason=task.escalation_reason)
+                else:
+                    task.escalation_reason = None
+                    if task.plan_required:
+                        task.plan_status = "done"
+                    transition(db, task, "done", actor="orchestrator", reason="all criteria passed, auto-approved")
+                    await self._publish_changes(db, task)
+            else:
+                await self._handle_failure(db, task, verdict.failure_reason or "verification failed", max_attempts, changed)
 
         changed.add(task.id)
         await bus.publish(
             {
                 "type": "verification",
                 "task_id": task.id,
-                "verdict": verdict.verdict,
+                "verdict": "bypassed" if task.bypass_verification else (verdict.verdict if verdict else "pending"),
             }
         )
 
@@ -397,7 +630,9 @@ class Orchestrator:
     def _recover(self) -> None:
         db = SessionLocal()
         try:
-            interrupted = db.query(Task).filter(Task.status.in_(["executing", "verifying"])).all()
+            interrupted = db.query(Task).filter(
+                Task.status.in_(["host_provisioning", "executing", "verifying"])
+            ).all()
             for task in interrupted:
                 for a in [a for a in task.attempts if a.status == "running"]:
                     a.status = "interrupted"

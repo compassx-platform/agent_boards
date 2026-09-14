@@ -13,6 +13,7 @@ RISK_RULES: dict[str, dict] = {
 STATUSES = [
     "backlog",
     "queued",
+    "host_provisioning",
     "executing",
     "verifying",
     "needs_review",
@@ -46,7 +47,10 @@ class Settings(BaseSettings):
     artifacts_dir: Path = Path("/root/.taskexec/artifacts")
 
     agent_capacity: int = 5
-    poll_interval_seconds: float = 1.0
+    # Baseline for the runtime "session status polling interval" setting (in the
+    # app_settings table). Raise it to cut orchestrator polling load — no agent
+    # finishes inside a second anyway; the default 10s cadence is fine.
+    poll_interval_seconds: float = 10.0
     max_execution_seconds: int = 600
 
     # Adapter: "opencode" (real headless opencode CLI agent, the default) or
@@ -92,6 +96,17 @@ class Settings(BaseSettings):
     # Host bring-up polling when dev/start returns host_online: false.
     host_start_poll_interval_seconds: float = 2.0
     host_start_max_wait_seconds: float = 30.0
+    # Dedicated host_provisioning stage (between queued and executing): before
+    # any attempt runs, the orchestrator creates the Omnigent session and keeps
+    # probing host readiness on an escalating timer — the first check fires
+    # after first_check_seconds, and every subsequent check doubles the delay
+    # (capped at max_check_seconds) until the dev host's workspace folder
+    # actually exists. Provisioning is free of the attempt budget, so slow host
+    # bring-up (CompassX can take minutes to materialize a fresh workspace)
+    # never consumes a retry. Gives up and blocks after max_checks attempts.
+    host_provisioning_first_check_seconds: float = 10.0
+    host_provisioning_max_check_seconds: float = 60.0
+    host_provisioning_max_checks: int = 180
     # Session binding: this host + repo dir the Omnigent agent runs in.
     omnigent_host_id: str = "97e1d6b0299b58a7b4b8a7f1eeafaaf1"
     omnigent_workspace: str = "/workspaces/app-59f99ff8a7854a50/ws_945bbda579d44d4d"

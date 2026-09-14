@@ -9,8 +9,9 @@ import type {
   HarnessesResponse,
   CompassXApp,
   CompassXWorkspace,
+  SettingsResponse,
 } from './lib/api'
-import { BOARD_COLUMNS, DEFAULT_HARNESS, PLAN_STATUS_META, STATUS_META, readStream, timeAgo, api } from './lib/api'
+import { BOARD_COLUMNS, DEFAULT_HARNESS, PLAN_STATUS_META, PROVISION_STEP_LABELS, STATUS_META, readStream, timeAgo, api } from './lib/api'
 import Checkout from './components/Checkout'
 import './App.css'
 
@@ -126,7 +127,7 @@ function TaskCard({ task, onClick }: { task: Task; onClick: (id: string) => void
 // ------------------------------------------------------------------------ board
 function Board({ tasks, onClick }: { tasks: Task[]; onClick: (id: string) => void }) {
   const byStatus = useMemo(() => {
-    const map: Record<string, Task[]> = { backlog: [], queued: [], executing: [], verifying: [], needs_review: [], done: [], rejected: [], blocked: [] }
+    const map: Record<string, Task[]> = { backlog: [], queued: [], host_provisioning: [], executing: [], verifying: [], needs_review: [], done: [], rejected: [], blocked: [] }
     for (const t of tasks) if (map[t.status]) map[t.status].push(t)
     return map
   }, [tasks])
@@ -201,6 +202,8 @@ function NewTaskForm({
   const [capability, setCapability] = useState('default')
   const [harness, setHarness] = useState(harnessData?.default ?? DEFAULT_HARNESS)
   const [planRequired, setPlanRequired] = useState(false)
+  const [bypassVerification, setBypassVerification] = useState(true)
+  const [bypassOutcome, setBypassOutcome] = useState('needs_review')
   const [workspace, setWorkspace] = useState('')
   const [deps, setDeps] = useState<string[]>([])
   const [criteria, setCriteria] = useState<CriterionDraft[]>([
@@ -254,6 +257,8 @@ function NewTaskForm({
     if (p.agent_capability) setCapability(p.agent_capability)
     if (p.harness) setHarness(p.harness)
     if (p.plan_required !== undefined) setPlanRequired(p.plan_required)
+    if (p.bypass_verification !== undefined) setBypassVerification(p.bypass_verification)
+    if (p.verification_bypass_outcome) setBypassOutcome(p.verification_bypass_outcome)
     if (p.workspace) setWorkspace(p.workspace)
     if (p.compassx_app_id) setAppId(p.compassx_app_id)
     if (p.criteria && p.criteria.length) {
@@ -294,6 +299,8 @@ function NewTaskForm({
         agent_capability: capability,
         harness,
         plan_required: planRequired,
+        bypass_verification: bypassVerification,
+        verification_bypass_outcome: bypassOutcome,
         workspace: workspace.trim() || undefined,
         compassx_app_id: appId || undefined,
         compassx_app_name: appId ? apps.find((a) => a.id === appId)?.name : undefined,
@@ -439,6 +446,22 @@ function NewTaskForm({
             <input type="checkbox" checked={planRequired} onChange={(e) => setPlanRequired(e.target.checked)} />
             Require an implementation plan (agent plans first → you approve → agent implements → PR)
           </label>
+        </div>
+
+        <div className="field">
+          <label className="checkbox-label">
+            <input type="checkbox" checked={bypassVerification} onChange={(e) => setBypassVerification(e.target.checked)} />
+            Bypass verification (skip definition-of-done checks)
+          </label>
+          {bypassVerification && (
+            <div className="row">
+              <select value={bypassOutcome} onChange={(e) => setBypassOutcome(e.target.value)}>
+                <option value="needs_review">When agent finishes → requires review (default)</option>
+                <option value="done">When agent finishes → mark done</option>
+              </select>
+              <p className="muted">Criteria are not evaluated; the finished task routes straight to the chosen outcome.</p>
+            </div>
+          )}
         </div>
 
         <div className="field">
@@ -651,6 +674,118 @@ function Reviews({
   )
 }
 
+// ------------------------------------------------------------------ settings
+function Settings() {
+  const [data, setData] = useState<SettingsResponse | null>(null)
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  const reload = useCallback(async () => {
+    const next = await api.settings()
+    setData(next)
+    setDraft(
+      Object.fromEntries(
+        Object.entries(next.settings).map(([k, v]) => [k, String(v)]),
+      ),
+    )
+    setSaved(false)
+  }, [])
+
+  useEffect(() => {
+    void reload().catch(() => setError('failed to load settings'))
+  }, [reload])
+
+  useEffect(() => {
+    setSaved(false)
+  }, [draft])
+
+  if (!data) {
+    return <div className="panel"><Empty text={error ?? 'Loading settings…'} /></div>
+  }
+
+  const entries = Object.entries(data.definitions)
+
+  const save = async () => {
+    const updates: Record<string, unknown> = {}
+    let firstError: string | null = null
+    for (const [key, def] of entries) {
+      const raw = draft[key] ?? ''
+      if (def.type === 'number') {
+        const n = Number(raw)
+        if (Number.isNaN(n)) {
+          firstError = firstError ?? `${def.label} must be a number`
+          continue
+        }
+        updates[key] = n
+      } else {
+        updates[key] = raw
+      }
+    }
+    if (firstError) {
+      setError(firstError)
+      return
+    }
+    setError(null)
+    try {
+      const next = await api.updateSettings(updates)
+      setData(next)
+      setDraft(Object.fromEntries(Object.entries(next.settings).map(([k, v]) => [k, String(v)])))
+      setSaved(true)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
+  return (
+    <div>
+      <h2>Settings</h2>
+      <div className="panel settings-panel">
+        {entries.length === 0 && <Empty text="No managed settings yet" />}
+        {entries.map(([key, def]) => {
+          const current = String(data.settings[key] ?? '')
+          const dirty = (draft[key] ?? '') !== current
+          return (
+            <div className="setting-row" key={key}>
+              <div className="setting-meta">
+                <strong>{def.label}</strong>
+                {def.description && <p className="muted">{def.description}</p>}
+              </div>
+              <div className="setting-input">
+                {def.type === 'number' ? (
+                  <input
+                    type="number"
+                    value={draft[key] ?? ''}
+                    min={def.min}
+                    max={def.max}
+                    step={def.step}
+                    onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+                  />
+                ) : (
+                  <input
+                    value={draft[key] ?? ''}
+                    onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+                  />
+                )}
+                {dirty && <span className="badge">unsaved</span>}
+              </div>
+            </div>
+          )
+        })}
+        {error && <div className="banner-error">{error}</div>}
+        <div className="row settings-actions">
+          <button className="link" onClick={() => reload()} disabled={saved}>
+            Reset
+          </button>
+          <button className="ok" onClick={() => void save()} disabled={saved}>
+            {saved ? `Saved ✓` : 'Save changes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ------------------------------------------------------------------ task detail
 function AuditList({ id }: { id: string }) {
   const [audits, setAudits] = useState<Awaited<ReturnType<typeof api.audit>>>([])
@@ -695,11 +830,12 @@ function TaskDetail({
     load()
   }, [load])
 
-  async function act(action: 'approve' | 'retry' | 'reject' | 'unblock' | 'approve_plan' | 'approve_execution') {
+  async function act(action: 'approve' | 'retry' | 'reject' | 'unblock' | 'approve_plan' | 'approve_execution' | 'new_session') {
     setBusy(true)
     setError(null)
     try {
       if (action === 'unblock') await api.unblock(id)
+      else if (action === 'new_session') await api.newSession(id)
       else if (action === 'approve_execution') await api.approveExecution(id, note)
       else await api.review(id, action as 'approve' | 'retry' | 'reject' | 'approve_plan', note)
       await load()
@@ -727,7 +863,9 @@ function TaskDetail({
             <p className="muted">
               {task.id.slice(0, 8)} · {task.priority} · risk {task.risk_tier} · {task.agent_capability} · harness{' '}
               <code>{task.harness || DEFAULT_HARNESS}</code> · workspace{' '}
-              <code>{task.workspace ?? 'default'}</code> · created {timeAgo(task.created_at)} by {task.created_by}
+              <code>{task.workspace ?? 'default'}</code> ·{' '}
+              {task.bypass_verification ? <span className="muted">verification bypassed → {task.verification_bypass_outcome}</span> : <span className="muted">verification on</span>}{' '}
+              · created {timeAgo(task.created_at)} by {task.created_by}
             </p>
           </div>
           <button className="ghost" onClick={onClose}>
@@ -753,6 +891,9 @@ function TaskDetail({
                     open
                   </a>
                 ) : null}
+                <button className="ghost" disabled={busy} onClick={() => act('new_session')}>
+                  New session
+                </button>
               </div>
             )}
 
@@ -788,6 +929,21 @@ function TaskDetail({
                       🔗 Open dev environment
                     </a>
                   </p>
+                )}
+                {task.provisioning_steps && task.provisioning_steps.length > 0 && (
+                  <div className="provision-steps">
+                    <h4>Host provisioning steps</h4>
+                    {task.provisioning_steps.map((s) => (
+                      <div className={`provision-step ps-${s.status}`} key={s.name}>
+                        <span className="ps-icon">
+                          {s.status === 'done' ? '✓' : s.status === 'failed' ? '✕' : s.status === 'running' ? '⟳' : '○'}
+                        </span>
+                        <span className="ps-label">{PROVISION_STEP_LABELS[s.name] ?? s.name}</span>
+                        {s.detail && <code className="ps-detail">{s.detail}</code>}
+                        <span className="ps-time">{timeAgo(s.updated_at)}</span>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             )}
@@ -887,6 +1043,11 @@ function TaskDetail({
                   <Chip>{s.provider}</Chip>
                   <code className="session-id">{s.session_id}</code>
                   {s.status && <Chip>{s.status}</Chip>}
+                  {s.archived ? (
+                    <Chip className="muted-chip">archived</Chip>
+                  ) : (
+                    <Chip className="active-chip">active</Chip>
+                  )}
                   <span className="muted">{timeAgo(s.created_at)}</span>
                 </div>
                 {s.link ? (
@@ -935,8 +1096,12 @@ function TaskDetail({
           {task.status === 'blocked' && (
             <section className="panel">
               <h3>Blocked</h3>
+              <p className="muted">Start a new agent session and retry with a clean slate.</p>
               <button disabled={busy} onClick={() => act('unblock')}>
                 Unblock
+              </button>
+              <button className="ok" disabled={busy} onClick={() => act('new_session')}>
+                New session &amp; retry
               </button>
             </section>
           )}
@@ -967,7 +1132,7 @@ function TaskDetail({
 // -------------------------------------------------------------------------- app
 export default function App() {
   const { tasks, metrics, caps, harnessData, error, refresh } = useTaskStore()
-  const [view, setView] = useState<'board' | 'new' | 'reviews'>('board')
+  const [view, setView] = useState<'board' | 'new' | 'reviews' | 'settings'>('board')
   const [selected, setSelected] = useState<string | null>(null)
 
   useEffect(() => {
@@ -996,6 +1161,9 @@ export default function App() {
           <button className={view === 'reviews' ? 'active' : ''} onClick={() => setView('reviews')}>
             Reviews {reviewCount > 0 ? <span className="badge">{reviewCount}</span> : null}
           </button>
+          <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>
+            Settings
+          </button>
         </nav>
         {metrics && (
           <div className="stats">
@@ -1020,8 +1188,10 @@ export default function App() {
           <Board tasks={tasks} onClick={setSelected} />
         ) : view === 'new' ? (
           <NewTaskForm tasks={tasks} caps={caps} harnessData={harnessData} refresh={refresh} onCreated={(id) => setSelected(id)} />
-        ) : (
+        ) : view === 'reviews' ? (
           <Reviews refresh={refresh} onOpen={setSelected} />
+        ) : (
+          <Settings />
         )}
       </main>
 

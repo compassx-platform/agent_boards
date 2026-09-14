@@ -53,6 +53,38 @@ class OmnigentAgent(AgentAdapter):
 
     # ---------------------------------------------------------------- helpers
 
+    async def _session_request(self, task: Task, phase: str, attempt_number: int) -> dict:
+        """Resolve agent/host/workspace and build the POST /v1/sessions body."""
+        agent_id, agent_name = await self._agent_for(task, phase)
+        harness = (task.harness or "").strip() or settings.omnigent_default_harness
+        host_id = (task.host_id or "").strip() or settings.omnigent_host_id
+        if (task.compassx_app_id or "").strip():
+            logger.info(
+                "task %s executes on CompassX host %s (%s, app %s)",
+                task.id, host_id, task.host_name, task.compassx_app_id,
+            )
+        elif host_id != settings.omnigent_host_id:
+            logger.info("task %s executes on host %s", task.id, host_id)
+        body: dict = {
+            "agent_id": agent_id,
+            "title": f"[{harness}] {task.title} (task {task.id[:8]})",
+            "host_id": host_id,
+            "workspace": self._workspace_for(task),
+        }
+        if phase == "implement":
+            body["git"] = {
+                "branch_name": (
+                    f"{settings.omnigent_branch_prefix}/{task.id[:8]}-{attempt_number}"
+                ),
+                "base_branch": "main",
+            }
+        return {
+            "body": body,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "harness": harness,
+        }
+
     async def _list_agents(self) -> list[dict]:
         """Live GET /v1/agents. Return [] and warn when unreachable."""
         try:
@@ -155,6 +187,37 @@ class OmnigentAgent(AgentAdapter):
             "say so explicitly and state the reason."
         )
 
+    async def _message_arrived(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        prompt: str,
+    ) -> bool:
+        """Return True if a user message with our prompt text reached the session."""
+        resp = await client.get(
+            f"{settings.omnigent_api_url}/v1/sessions/{session_id}/items",
+            headers=self._headers(),
+        )
+        if resp.status_code >= 400:
+            return False
+        needle = (prompt or "").strip()[:120]
+        if not needle:
+            return False
+        for item in resp.json().get("data", []):
+            if item.get("type") != "message" or item.get("role") != "user":
+                continue
+            content = item.get("content")
+            text = content if isinstance(content, str) else ""
+            if isinstance(content, list):
+                text = "\n".join(
+                    str(b.get("text", ""))
+                    for b in content
+                    if isinstance(b, dict) and b.get("text")
+                )
+            if needle in (text or ""):
+                return True
+        return False
+
     def _items_summary(self, items: list[dict]) -> tuple[str, list[str], list[str]]:
         """Return (assistant_text, tool_names, errors)."""
         text_parts: list[str] = []
@@ -189,6 +252,82 @@ class OmnigentAgent(AgentAdapter):
 
     # ------------------------------------------------------------- interface
 
+    def needs_provisioning(self, task: Task) -> bool:
+        """CompassX-bound tasks run a remote dev host that needs to be brought
+        up and confirmed ready before any attempt starts."""
+        return bool((task.compassx_app_id or "").strip())
+
+    async def provision(self, task: Task, phase: str = "execute") -> str:
+        """Create the execution session during host bring-up. This doubles as
+        the host-readiness check: the dev host's workspace folder materializes
+        asynchronously (dev/start can return before mkdir + git clone finish on
+        the runner), so this delegates to create_session's bounded
+        workspace-ready retry. Once created, the session is reused by later
+        attempts (the orchestrator guards against double-create via
+        task.session_id).
+        """
+        return await self.create_session(task, phase, task.current_attempt)
+
+    async def create_session(
+        self,
+        task: Task,
+        phase: str = "execute",
+        attempt_number: int | None = None,
+    ) -> str:
+        """Create exactly ONE fresh Omnigent session for the task (with the
+        workspace-materialization retry). Used on the first attempt and by the
+        explicit "new session" endpoint; every later attempt reuses the session
+        the orchestrator persists on the task. Returns the new session id.
+        """
+        req = await self._session_request(
+            task, phase,
+            attempt_number if attempt_number is not None else task.current_attempt,
+        )
+        body = req["body"]
+        host_id = body["host_id"]
+        deadline = asyncio.get_running_loop().time() + settings.host_start_max_wait_seconds
+        last_error: str | None = None
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions",
+                    headers=self._headers(),
+                    json=body,
+                )
+                if resp.status_code < 400:
+                    session_id = resp.json()["id"]
+                    logger.info(
+                        "task %s created session %s on host %s (phase=%s)",
+                        task.id, session_id, host_id, phase,
+                    )
+                    return session_id
+                detail = f"{resp.status_code} {resp.text[:300]}"
+                last_error = f"omnigent session create failed: {detail}"
+                retryable = (
+                    "workspace path does not exist" in resp.text
+                    and asyncio.get_running_loop().time() < deadline
+                )
+                if not retryable:
+                    break
+                logger.warning(
+                    "task %s workspace path not ready on host %s; retrying session create: %s",
+                    task.id, host_id, resp.text[:200],
+                )
+                if (task.compassx_app_id or "").strip():
+                    try:
+                        from app.compassx import compassx
+
+                        status = await compassx.dev_status(task.compassx_app_id)
+                        if str(status.get("status") or "").lower() != "active":
+                            logger.warning(
+                                "task %s dev sandbox no longer active: %s",
+                                task.id, {k: status.get(k) for k in ("status", "host_online")},
+                            )
+                    except Exception as exc:  # noqa: BLE001 — dev/status is best-effort here
+                        logger.warning("task %s dev/status refresh failed: %s", task.id, exc)
+                await asyncio.sleep(settings.host_start_poll_interval_seconds)
+        raise RuntimeError(last_error)
+
     async def submit(
         self,
         task: Task,
@@ -196,60 +335,67 @@ class OmnigentAgent(AgentAdapter):
         attempt_id: str,
         artifacts_dir: str,
         phase: str = "execute",
+        session_id: str | None = None,
     ) -> str:
-        agent_id, agent_name = await self._agent_for(task, phase)
-        harness = (task.harness or "").strip() or settings.omnigent_default_harness
-        host_id = (task.host_id or "").strip() or settings.omnigent_host_id
-        if (task.compassx_app_id or "").strip():
-            logger.info(
-                "task %s executes on CompassX host %s (%s, app %s)",
-                task.id, host_id, task.host_name, task.compassx_app_id,
-            )
-        elif host_id != settings.omnigent_host_id:
-            logger.info("task %s executes on host %s", task.id, host_id)
-        body: dict = {
-            "agent_id": agent_id,
-            "title": f"[{harness}] {task.title} (task {task.id[:8]})",
-            "host_id": host_id,
-            "workspace": self._workspace_for(task),
-        }
-        if phase == "implement":
-            body["git"] = {
-                "branch_name": (
-                    f"{settings.omnigent_branch_prefix}/{task.id[:8]}-{attempt_number}"
-                ),
-                "base_branch": "main",
-            }
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{settings.omnigent_api_url}/v1/sessions",
-                headers=self._headers(),
-                json=body,
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(f"omnigent session create failed: {resp.status_code} {resp.text[:300]}")
-            session = resp.json()
-            session_id = session["id"]
+        req = await self._session_request(task, phase, attempt_number)
+        agent_id = req["agent_id"]
+        agent_name = req["agent_name"]
+        harness = req["harness"]
+        body = req["body"]
+        host_id = body["host_id"]
 
-            event = {
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": self._prompt_for(task, phase, attempt_number),
-                        }
-                    ],
-                },
-            }
-            eresp = await client.post(
-                f"{settings.omnigent_api_url}/v1/sessions/{session_id}/events",
-                headers=self._headers(),
-                json=event,
-            )
-            if eresp.status_code >= 400:
-                raise RuntimeError(f"omnigent message dispatch failed: {eresp.status_code} {eresp.text[:300]}")
+        if session_id is None:
+            session_id = await self.create_session(task, phase, attempt_number)
+
+        prompt = self._prompt_for(task, phase, attempt_number)
+        event = {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            },
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            dispatch_error: Exception | None = None
+            for _ in range(2):
+                dispatch_error = None
+                try:
+                    eresp = await client.post(
+                        f"{settings.omnigent_api_url}/v1/sessions/{session_id}/events",
+                        headers=self._headers(),
+                        json=event,
+                    )
+                except httpx.HTTPError as exc:
+                    dispatch_error = exc
+                else:
+                    if eresp.status_code < 400:
+                        break
+                    dispatch_error = RuntimeError(
+                        f"omnigent message dispatch failed: {eresp.status_code} {eresp.text[:300]}"
+                    )
+                # A transport-level timeout/error is ambiguous: the server may
+                # have accepted the event anyway. Verify delivery before
+                # resending or failing, so a slow-but-successful dispatch is
+                # never double-sent nor counted as a failed attempt.
+                try:
+                    arrived = await self._message_arrived(client, session_id, prompt)
+                except Exception as exc:  # noqa: BLE001 — verification is best-effort
+                    logger.warning(
+                        "task %s dispatch verification failed for session %s: %s",
+                        task.id, session_id, exc,
+                    )
+                    arrived = False
+                if arrived:
+                    logger.warning(
+                        "task %s events dispatch to session %s reported failure (%s) "
+                        "but the message was delivered; continuing",
+                        task.id, session_id, dispatch_error,
+                    )
+                    dispatch_error = None
+                    break
+                await asyncio.sleep(2)
+            if dispatch_error:
+                raise dispatch_error
 
         Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
         self._exec[session_id] = {

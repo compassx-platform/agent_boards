@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Float, ForeignKey, String, Text
+from sqlalchemy import Boolean, Float, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -58,6 +58,14 @@ class Task(Base):
     host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     host_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     dev_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Live provisioning checklist (JSON array of {name, status, detail,
+    # updated_at}); each entry tracks one host bring-up step so the UI can show
+    # "all steps + their current status" while a CompassX dev host starts.
+    provisioning_steps: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The single agent session bound to this task. It is created once (during
+    # host_provisioning or on the first attempt) and reused by every attempt
+    # until the user explicitly requests a fresh one (POST /new_session).
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     current_attempt: Mapped[int] = mapped_column(default=0)
     max_attempts: Mapped[int] = mapped_column(default=3)
     escalation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -71,6 +79,13 @@ class Task(Base):
     plan_required: Mapped[bool] = mapped_column(default=False)
     plan_status: Mapped[str] = mapped_column(String(32), default="none")
     plan_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Verification bypass: when enabled, the definition-of-done verification
+    # step is skipped and a finished execution walks straight to the configured
+    # outcome instead of evaluating the task's criteria.
+    # verification_bypass_outcome: "needs_review" (default) | "done"
+    bypass_verification: Mapped[bool] = mapped_column(default=True)
+    verification_bypass_outcome: Mapped[str] = mapped_column(String(32), default="needs_review")
 
     criteria: Mapped[list["Criterion"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", order_by="Criterion.created_at"
@@ -163,11 +178,27 @@ class ExecutionSession(Base):
     session_id: Mapped[str] = mapped_column(String(128))
     link: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str | None] = mapped_column(String(16), nullable=True)  # running|finished|failed
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="sessions")
     attempt: Mapped[Attempt | None] = relationship()
+
+
+class AppSetting(Base):
+    """Runtime-configurable application settings (key/value, JSON values).
+
+    Defaults come from SETTING_DEFS; any row here overrides them. Editable via
+    GET/PUT /settings — the first managed setting is the orchestrator's session
+    status polling interval.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="null")
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
 
 class AuditLog(Base):
