@@ -450,6 +450,368 @@ async def harnesses() -> dict:
     }
 
 
+@router.get("/omnigent/sessions")
+async def omnigent_sessions(
+    kind: str | None = Query(default=None),
+    search_query: str | None = Query(default=None),
+    sort_by: str | None = Query(default=None),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    include_archived: bool = Query(default=False),
+) -> dict:
+    """Session browsing list, proxied live from the Omnigent server.
+
+    Read-only passthrough of ``GET /v1/sessions``: nothing is persisted here,
+    the page always reflects what the server has right now.
+    """
+    from app.adapters.omnigent import OmnigentAgent
+
+    sessions, has_more, err = await OmnigentAgent().list_sessions(
+        kind=kind,
+        search_query=search_query,
+        sort_by=sort_by,
+        order=order,
+        limit=limit,
+        include_archived=include_archived,
+    )
+    return {
+        "source": "live" if not err else "unavailable",
+        "sessions": sessions,
+        "has_more": has_more,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}")
+async def omnigent_session_snapshot(session_id: str) -> dict:
+    """Session snapshot (identity, status, labels) proxied live."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    session, err = await OmnigentAgent().session_snapshot(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/items")
+async def omnigent_session_items(session_id: str) -> dict:
+    """Full conversation items for a session, proxied live (not stored)."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    items, err = await OmnigentAgent().session_items(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "items": items,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions")
+async def omnigent_create_session(request: Request) -> dict:
+    """Create a new Omnigent session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    session, err = await OmnigentAgent().create_session_direct(body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.patch("/omnigent/sessions/{session_id}")
+async def omnigent_update_session(session_id: str, request: Request) -> dict:
+    """Update Omnigent session attributes (title, labels, archived)."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    session, err = await OmnigentAgent().update_session(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.delete("/omnigent/sessions/{session_id}")
+async def omnigent_delete_session(session_id: str) -> dict:
+    """Delete an Omnigent session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    success, err = await OmnigentAgent().delete_session(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "success": success,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/auto-title")
+async def omnigent_auto_title(session_id: str) -> dict:
+    """Automatically generate a concise title for a session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    result, err = await OmnigentAgent().auto_title_session(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "result": result,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/fork")
+async def omnigent_fork_session(session_id: str, request: Request) -> dict:
+    """Fork an existing session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    session, err = await OmnigentAgent().fork_session(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/events")
+async def omnigent_send_event(session_id: str, request: Request) -> dict:
+    """Send an event / user turn / interrupt / elicitation response to a session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    resp, err = await OmnigentAgent().send_event(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "response": resp,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/stream")
+async def omnigent_session_stream(session_id: str):
+    """Proxy live SSE stream from Omnigent server."""
+    headers = {"Authorization": f"Bearer {settings.omnigent_api_key}"} if settings.omnigent_api_key else {}
+
+    async def event_generator():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "GET",
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/stream",
+                    headers=headers,
+                ) as resp:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+        except Exception as exc:
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n".encode()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/omnigent/sessions/{session_id}/environments")
+async def omnigent_environments(session_id: str) -> dict:
+    """List session environments."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    envs, err = await OmnigentAgent().list_environments(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "environments": envs,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/environments/{env_id}/filesystem")
+async def omnigent_filesystem(
+    session_id: str, env_id: str, path: str = Query(default="")
+) -> dict:
+    """Read file content or list folder entries in session environment."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    data, err = await OmnigentAgent().get_environment_filesystem(session_id, env_id, path)
+    return {
+        "source": "live" if not err else "unavailable",
+        "data": data,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/environments/{env_id}/changes")
+async def omnigent_environment_changes(session_id: str, env_id: str) -> dict:
+    """List git / filesystem changes in session environment."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    changes, err = await OmnigentAgent().get_environment_changes(session_id, env_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "changes": changes,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/environments/{env_id}/search")
+async def omnigent_environment_search(
+    session_id: str, env_id: str, q: str = Query(default="")
+) -> dict:
+    """Search files in session environment."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    results, err = await OmnigentAgent().search_environment(session_id, env_id, q)
+    return {
+        "source": "live" if not err else "unavailable",
+        "results": results,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/terminals")
+async def omnigent_terminals(session_id: str) -> dict:
+    """List terminals for a session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    terminals, err = await OmnigentAgent().list_terminals(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "terminals": terminals,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/terminals")
+async def omnigent_create_terminal(session_id: str, request: Request) -> dict:
+    """Create / launch a terminal on the session host."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    terminal, err = await OmnigentAgent().create_terminal(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "terminal": terminal,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.delete("/omnigent/sessions/{session_id}/terminals/{terminal_id}")
+async def omnigent_delete_terminal(session_id: str, terminal_id: str) -> dict:
+    """Close a session terminal."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    success, err = await OmnigentAgent().delete_terminal(session_id, terminal_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "success": success,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/agents")
+async def omnigent_agents() -> dict:
+    """List all registered agents on the Omnigent server."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    agents, err = await OmnigentAgent().list_agents_full()
+    return {
+        "source": "live" if not err else "unavailable",
+        "agents": agents,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/hosts")
+async def omnigent_hosts() -> dict:
+    """List all registered hosts and runner capabilities on the Omnigent server."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    hosts, err = await OmnigentAgent().list_hosts_full()
+    return {
+        "source": "live" if not err else "unavailable",
+        "hosts": hosts,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/scheduled-tasks")
+async def omnigent_scheduled_tasks() -> dict:
+    """List scheduled cron tasks."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    tasks, err = await OmnigentAgent().list_scheduled_tasks()
+    return {
+        "source": "live" if not err else "unavailable",
+        "scheduled_tasks": tasks,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/scheduled-tasks")
+async def omnigent_create_scheduled_task(request: Request) -> dict:
+    """Create a new scheduled task."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    task, err = await OmnigentAgent().create_scheduled_task(body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "scheduled_task": task,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/scheduled-tasks/{task_id}/run")
+async def omnigent_run_scheduled_task(task_id: str) -> dict:
+    """Run a scheduled task immediately."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    result, err = await OmnigentAgent().run_scheduled_task(task_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "result": result,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.delete("/omnigent/scheduled-tasks/{task_id}")
+async def omnigent_delete_scheduled_task(task_id: str) -> dict:
+    """Delete a scheduled task."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    success, err = await OmnigentAgent().delete_scheduled_task(task_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "success": success,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
 @router.get("/compassx/apps")
 async def compassx_apps() -> dict:
     """CompassX applications (populates the per-task app picker).

@@ -13,6 +13,7 @@ import type {
 } from './lib/api'
 import { BOARD_COLUMNS, DEFAULT_HARNESS, PLAN_STATUS_META, PROVISION_STEP_LABELS, STATUS_META, readStream, timeAgo, api } from './lib/api'
 import Checkout from './components/Checkout'
+import SessionsPage from './Sessions'
 import './App.css'
 
 // ------------------------------------------------------------------------- data
@@ -812,10 +813,12 @@ function TaskDetail({
   id,
   onClose,
   refresh,
+  onOpenSession,
 }: {
   id: string
   onClose: () => void
   refresh: () => Promise<void>
+  onOpenSession: (sessionId: string) => void
 }) {
   const [task, setTask] = useState<Task | null>(null)
   const [note, setNote] = useState('')
@@ -896,6 +899,13 @@ function TaskDetail({
                     open
                   </a>
                 ) : null}
+                <button
+                  className="ghost"
+                  title="Open this session's conversation in the Sessions view"
+                  onClick={() => onOpenSession(task.session_id!)}
+                >
+                  conversation
+                </button>
                 <button className="ghost" disabled={busy} onClick={() => act('new_session')}>
                   New session
                 </button>
@@ -1137,12 +1147,19 @@ function TaskDetail({
 // -------------------------------------------------------------------------- app
 export default function App() {
   const { tasks, metrics, caps, harnessData, error, refresh } = useTaskStore()
-  const [view, setView] = useState<'board' | 'new' | 'reviews' | 'settings'>('board')
+  const [view, setView] = useState<'board' | 'new' | 'reviews' | 'settings' | 'sessions'>('board')
   const [selected, setSelected] = useState<string | null>(null)
+  const [sessionFocus, setSessionFocus] = useState<string | null>(null)
 
   useEffect(() => {
     setSelected(null)
   }, [view])
+
+  const openSession = (sessionId: string) => {
+    setView('sessions')
+    setSessionFocus(sessionId)
+    setSelected(null)
+  }
 
   const reviewCount = tasks.filter((t) => t.status === 'needs_review').length
   const adapter = caps[0]?.adapter ?? '…'
@@ -1165,6 +1182,9 @@ export default function App() {
           </button>
           <button className={view === 'reviews' ? 'active' : ''} onClick={() => setView('reviews')}>
             Reviews {reviewCount > 0 ? <span className="badge">{reviewCount}</span> : null}
+          </button>
+          <button className={view === 'sessions' ? 'active' : ''} onClick={() => setView('sessions')}>
+            Sessions
           </button>
           <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>
             Settings
@@ -1195,12 +1215,14 @@ export default function App() {
           <NewTaskForm tasks={tasks} caps={caps} harnessData={harnessData} refresh={refresh} onCreated={(id) => setSelected(id)} />
         ) : view === 'reviews' ? (
           <Reviews refresh={refresh} onOpen={setSelected} />
+        ) : view === 'sessions' ? (
+          <SessionsPage focus={sessionFocus} />
         ) : (
           <Settings />
         )}
       </main>
 
-      {selected && <TaskDetail id={selected} refresh={refresh} onClose={() => setSelected(null)} />}
+      {selected && <TaskDetail id={selected} refresh={refresh} onClose={() => setSelected(null)} onOpenSession={openSession} />}
     </div>
   )
 }

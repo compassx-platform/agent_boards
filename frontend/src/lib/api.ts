@@ -303,6 +303,194 @@ export const api = {
       body: JSON.stringify({ text }),
     }),
   seed: () => http<{ created: number }>('/demo/seed', { method: 'POST' }),
+  omnigentSessions: (opts?: {
+    kind?: string
+    search_query?: string
+    sort_by?: string
+    order?: string
+    limit?: number
+    include_archived?: boolean
+  }) => {
+    const params = new URLSearchParams()
+    if (opts?.kind) params.set('kind', opts.kind)
+    if (opts?.search_query) params.set('search_query', opts.search_query)
+    if (opts?.sort_by) params.set('sort_by', opts.sort_by)
+    if (opts?.order) params.set('order', opts.order)
+    if (opts?.limit != null) params.set('limit', String(opts.limit))
+    if (opts?.include_archived) params.set('include_archived', 'true')
+    const qs = params.toString()
+    return http<OmnigentListResponse>('/omnigent/sessions' + (qs ? `?${qs}` : ''))
+  },
+  omnigentCreateSession: (payload: {
+    agent_id: string
+    title?: string
+    workspace?: string
+    host_id?: string
+    model?: string
+    reasoning_effort?: string
+    initial_message?: string
+    git?: { branch_name?: string; base_branch?: string }
+    [key: string]: unknown
+  }) =>
+    http<OmnigentSessionResponse>('/omnigent/sessions', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  omnigentSession: (id: string) =>
+    http<OmnigentSessionResponse>(`/omnigent/sessions/${encodeURIComponent(id)}`),
+  omnigentUpdateSession: (id: string, payload: { title?: string; archived?: boolean; labels?: Record<string, unknown> }) =>
+    http<OmnigentSessionResponse>(`/omnigent/sessions/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  omnigentDeleteSession: (id: string) =>
+    http<{ source: string; success: boolean; error: string | null }>(`/omnigent/sessions/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  omnigentAutoTitle: (id: string) =>
+    http<{ source: string; result: { title?: string } | null; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/auto-title`,
+      { method: 'POST' },
+    ),
+  omnigentForkSession: (id: string, payload: { agent_id?: string; title?: string }) =>
+    http<OmnigentSessionResponse>(`/omnigent/sessions/${encodeURIComponent(id)}/fork`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  omnigentSendEvent: (id: string, event: { type: string; data?: Record<string, unknown> }) =>
+    http<{ source: string; response: unknown; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/events`,
+      {
+        method: 'POST',
+        body: JSON.stringify(event),
+      },
+    ),
+  omnigentSendMessage: (id: string, text: string) =>
+    http<{ source: string; response: unknown; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/events`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'message',
+          data: {
+            role: 'user',
+            content: [{ type: 'input_text', text }],
+          },
+        }),
+      },
+    ),
+  omnigentInterrupt: (id: string) =>
+    http<{ source: string; response: unknown; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/events`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'interrupt',
+          data: {},
+        }),
+      },
+    ),
+  omnigentResolveElicitation: (id: string, elicitationId: string, value: unknown) =>
+    http<{ source: string; response: unknown; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/events`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'external_elicitation_resolved',
+          data: {
+            elicitation_id: elicitationId,
+            response: value,
+          },
+        }),
+      },
+    ),
+  omnigentSessionItems: (id: string) =>
+    http<OmnigentItemsResponse>(`/omnigent/sessions/${encodeURIComponent(id)}/items`),
+  omnigentEnvironments: (id: string) =>
+    http<{ source: string; environments: OmnigentEnvironment[]; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/environments`,
+    ),
+  omnigentFilesystem: (id: string, envId: string, path: string = '') =>
+    http<{ source: string; data: OmnigentFilesystemResponse | null; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/environments/${encodeURIComponent(envId)}/filesystem?path=${encodeURIComponent(path)}`,
+    ),
+  omnigentEnvironmentChanges: (id: string, envId: string) =>
+    http<{ source: string; changes: OmnigentChangeEntry[]; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/environments/${encodeURIComponent(envId)}/changes`,
+    ),
+  omnigentEnvironmentSearch: (id: string, envId: string, q: string) =>
+    http<{ source: string; results: OmnigentChangeEntry[]; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/environments/${encodeURIComponent(envId)}/search?q=${encodeURIComponent(q)}`,
+    ),
+  omnigentTerminals: (id: string) =>
+    http<{ source: string; terminals: OmnigentTerminal[]; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/terminals`,
+    ),
+  omnigentCreateTerminal: (id: string, payload?: { terminal_name?: string; session_key?: string }) =>
+    http<{ source: string; terminal: OmnigentTerminal | null; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/terminals`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload ?? {}),
+      },
+    ),
+  omnigentDeleteTerminal: (id: string, terminalId: string) =>
+    http<{ source: string; success: boolean; error: string | null }>(
+      `/omnigent/sessions/${encodeURIComponent(id)}/terminals/${encodeURIComponent(terminalId)}`,
+      { method: 'DELETE' },
+    ),
+  omnigentAgents: () =>
+    http<{ source: string; agents: OmnigentAgentDef[]; error: string | null }>('/omnigent/agents'),
+  omnigentHosts: () =>
+    http<{ source: string; hosts: OmnigentHostDef[]; error: string | null }>('/omnigent/hosts'),
+  omnigentScheduledTasks: () =>
+    http<{ source: string; scheduled_tasks: OmnigentScheduledTask[]; error: string | null }>('/omnigent/scheduled-tasks'),
+  omnigentCreateScheduledTask: (payload: {
+    name: string
+    agent_id: string
+    prompt: string
+    cron_expression: string
+    workspace?: string
+    host_id?: string
+    model?: string
+  }) =>
+    http<{ source: string; scheduled_task: OmnigentScheduledTask | null; error: string | null }>(
+      '/omnigent/scheduled-tasks',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    ),
+  omnigentRunScheduledTask: (taskId: string) =>
+    http<{ source: string; result: unknown; error: string | null }>(
+      `/omnigent/scheduled-tasks/${encodeURIComponent(taskId)}/run`,
+      { method: 'POST' },
+    ),
+  omnigentDeleteScheduledTask: (taskId: string) =>
+    http<{ source: string; success: boolean; error: string | null }>(
+      `/omnigent/scheduled-tasks/${encodeURIComponent(taskId)}`,
+      { method: 'DELETE' },
+    ),
+}
+
+export function readOmnigentStream(
+  sessionId: string,
+  onEvent: (event: { type?: string; event_type?: string; data?: unknown; [key: string]: unknown }) => void,
+  onError?: (err: Event) => void,
+): EventSource {
+  const es = new EventSource(`${BASE}/omnigent/sessions/${encodeURIComponent(sessionId)}/stream`)
+  es.onmessage = (msg) => {
+    try {
+      const data = JSON.parse(msg.data)
+      onEvent(data)
+    } catch {
+      /* ignore non-json */
+    }
+  }
+  es.onerror = (e) => {
+    if (onError) onError(e)
+  }
+  return es
 }
 
 export async function readStream(onEvent: (event: { type: string; task?: Task }) => void): Promise<EventSource> {
@@ -316,6 +504,207 @@ export async function readStream(onEvent: (event: { type: string; task?: Task })
   }
   es.onerror = () => es.close()
   return es
+}
+
+// ── Omnigent session browsing & client models ──
+
+export type OmnigentSessionStatus = 'idle' | 'running' | 'waiting' | 'failed'
+
+export interface OmnigentBlock {
+  type: string
+  text?: string
+  [key: string]: unknown
+}
+
+export interface OmnigentItem {
+  id: string
+  type: string
+  status?: string
+  response_id?: string
+  created_at?: number
+  role?: 'user' | 'assistant'
+  content?: string | OmnigentBlock[]
+  model?: string
+  name?: string
+  arguments?: string
+  call_id?: string
+  output?: string
+  message?: string
+  code?: string
+  source?: string
+  summary?: OmnigentBlock[]
+  event_type?: string
+  resource_type?: string
+  data?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+export interface OmnigentElicitation {
+  id: string
+  type?: string
+  message?: string
+  prompt?: string
+  schema?: Record<string, unknown>
+  options?: string[]
+  [key: string]: unknown
+}
+
+export interface OmnigentSkill {
+  name: string
+  description?: string
+  [key: string]: unknown
+}
+
+export interface OmnigentTodo {
+  id?: string
+  content?: string
+  text?: string
+  status?: 'completed' | 'in_progress' | 'pending' | string
+  [key: string]: unknown
+}
+
+export interface OmnigentSession {
+  id: string
+  agent_id: string
+  agent_name: string | null
+  status: OmnigentSessionStatus
+  title: string | null
+  created_at: number
+  updated_at: number
+  archived: boolean
+  host_id: string | null
+  runner_online: boolean | null
+  host_online: boolean | null
+  workspace: string | null
+  git_branch: string | null
+  harness?: string | null
+  pending_elicitations_count?: number
+  pending_elicitations?: OmnigentElicitation[]
+  skills?: OmnigentSkill[]
+  todos?: OmnigentTodo[]
+  owner?: string | null
+  items?: OmnigentItem[]
+  labels?: Record<string, unknown>
+  total_cost_usd?: number | null
+  last_task_error?: { message?: string; code?: string; [key: string]: unknown } | null
+  [key: string]: unknown
+}
+
+export interface OmnigentEnvironment {
+  id: string
+  object?: string
+  type?: string
+  name?: string
+  metadata?: {
+    root?: string
+    environment_type?: string
+    terminal_name?: string
+    session_key?: string
+    [key: string]: unknown
+  }
+  [key: string]: unknown
+}
+
+export interface OmnigentFilesystemEntry {
+  id?: string
+  name: string
+  path: string
+  type: 'file' | 'directory'
+  bytes?: number | null
+  modified_at?: number | null
+}
+
+export interface OmnigentFilesystemResponse {
+  object?: string
+  base?: string
+  path?: string
+  content?: string
+  content_type?: string
+  data?: OmnigentFilesystemEntry[]
+  truncated?: boolean
+}
+
+export interface OmnigentChangeEntry {
+  path: string
+  name?: string
+  status: 'created' | 'modified' | 'deleted' | string
+  bytes?: number
+  lines_added?: number | null
+  lines_removed?: number | null
+  modified_at?: number
+}
+
+export interface OmnigentTerminal {
+  id: string
+  name?: string
+  metadata?: {
+    running?: boolean
+    terminal_name?: string
+    session_key?: string
+    tmux_target?: string
+    direct_attach_url?: string
+    [key: string]: unknown
+  }
+}
+
+export interface OmnigentAgentDef {
+  id: string
+  name: string
+  description?: string | null
+  harness: string
+  builtin: boolean
+  version?: number
+  mcp_servers?: unknown[]
+  skills?: OmnigentSkill[]
+  policies?: unknown[]
+  created_at?: number
+  [key: string]: unknown
+}
+
+export interface OmnigentHostDef {
+  host_id: string
+  name: string
+  status: string
+  owner?: string
+  configured_harnesses?: Record<string, boolean | string>
+  [key: string]: unknown
+}
+
+export interface OmnigentScheduledTask {
+  id: string
+  name: string
+  agent_id: string
+  agent_name?: string
+  prompt: string
+  cron_expression: string
+  status?: string
+  last_run_at?: number
+  next_run_at?: number
+  workspace?: string
+  host_id?: string
+  [key: string]: unknown
+}
+
+export interface OmnigentListResponse {
+  source: string
+  sessions: OmnigentSession[]
+  has_more: boolean
+  error: string | null
+  base_url?: string
+}
+
+export interface OmnigentSessionResponse {
+  source: string
+  session: OmnigentSession | null
+  error: string | null
+  base_url?: string
+}
+
+export interface OmnigentItemsResponse {
+  source: string
+  items: OmnigentItem[]
+  error: string | null
+  base_url?: string
 }
 
 export const STATUS_META: Record<Status, { label: string; color: string }> = {
