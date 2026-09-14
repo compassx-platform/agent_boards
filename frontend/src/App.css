@@ -684,6 +684,12 @@ select[multiple] {
 .session { border-bottom: 1px solid #2c2c2e; padding: 6px 0; }
 .session-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .session-id { font-size: 12px; overflow-wrap: anywhere; }
+/* live agent-session status chip (running / idle / failed / …) */
+.session-state { }
+.session-state-running { border-color: var(--ok); color: var(--ok); }
+.session-state-idle { border-color: var(--warn); color: var(--warn); }
+.session-state-failed { border-color: var(--bad); color: var(--bad); }
+.session-state-finished { border-color: #30d158; color: #30d158; }
 
 /* settings */
 .settings-panel { display: flex; flex-direction: column; gap: 14px; }

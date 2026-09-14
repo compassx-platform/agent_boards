@@ -885,6 +885,11 @@ function TaskDetail({
             {task.session_id && (
               <div className="session-id-line">
                 <Chip className="r-medium">{task.session_provider ?? 'agent'} session</Chip>
+                {task.session_status && (
+                  <Chip className={`session-state session-state-${task.session_status}`} title="live session status">
+                    {task.session_status}
+                  </Chip>
+                )}
                 <code>{task.session_id}</code>
                 {task.session_link ? (
                   <a href={task.session_link} target="_blank" rel="noreferrer">
@@ -1042,7 +1047,7 @@ function TaskDetail({
                 <div className="session-head">
                   <Chip>{s.provider}</Chip>
                   <code className="session-id">{s.session_id}</code>
-                  {s.status && <Chip>{s.status}</Chip>}
+                  {s.status && <Chip className={`session-state session-state-${s.status}`}>{s.status}</Chip>}
                   {s.archived ? (
                     <Chip className="muted-chip">archived</Chip>
                   ) : (

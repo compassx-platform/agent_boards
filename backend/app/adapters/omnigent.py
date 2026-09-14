@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from app.adapters import AgentAdapter, ExecutionResult, ExecutionStatus
+from app.adapters import AgentAdapter, ExecutionResult, ExecutionStatus, ProgressCallback
 from app.config import settings
 from app.models import Task
 
@@ -257,27 +257,43 @@ class OmnigentAgent(AgentAdapter):
         up and confirmed ready before any attempt starts."""
         return bool((task.compassx_app_id or "").strip())
 
-    async def provision(self, task: Task, phase: str = "execute") -> str:
+    async def provision(
+        self,
+        task: Task,
+        phase: str = "execute",
+        progress: ProgressCallback | None = None,
+    ) -> str:
         """Create the execution session during host bring-up. This doubles as
         the host-readiness check: the dev host's workspace folder materializes
         asynchronously (dev/start can return before mkdir + git clone finish on
         the runner), so this delegates to create_session's bounded
-        workspace-ready retry. Once created, the session is reused by later
-        attempts (the orchestrator guards against double-create via
-        task.session_id).
+        workspace-ready retry. ``progress`` is forwarded to create_session so
+        every retry is surfaced live on the provisioning checklist. Once
+        created, the session is reused by later attempts (the orchestrator
+        guards against double-create via task.session_id).
         """
-        return await self.create_session(task, phase, task.current_attempt)
+        return await self.create_session(
+            task, phase, task.current_attempt, progress=progress
+        )
 
     async def create_session(
         self,
         task: Task,
         phase: str = "execute",
         attempt_number: int | None = None,
+        progress: ProgressCallback | None = None,
     ) -> str:
         """Create exactly ONE fresh Omnigent session for the task (with the
         workspace-materialization retry). Used on the first attempt and by the
         explicit "new session" endpoint; every later attempt reuses the session
         the orchestrator persists on the task. Returns the new session id.
+
+        The Omnigent dev host's workspace folder materializes asynchronously —
+        dev/start returns before the runner's mkdir + clone finish — so a
+        session create that hits "workspace path does not exist" is retried
+        until the deadline. ``progress`` (when given) pushes each retry's state:
+        attempt number, elapsed time, and the underlying reason, so the UI can
+        explain why this step is slow instead of sitting on a generic spinner.
         """
         req = await self._session_request(
             task, phase,
@@ -285,8 +301,11 @@ class OmnigentAgent(AgentAdapter):
         )
         body = req["body"]
         host_id = body["host_id"]
-        deadline = asyncio.get_running_loop().time() + settings.host_start_max_wait_seconds
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        deadline = started_at + settings.host_start_max_wait_seconds
         last_error: str | None = None
+        retries = 0
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
                 resp = await client.post(
@@ -297,32 +316,45 @@ class OmnigentAgent(AgentAdapter):
                 if resp.status_code < 400:
                     session_id = resp.json()["id"]
                     logger.info(
-                        "task %s created session %s on host %s (phase=%s)",
-                        task.id, session_id, host_id, phase,
+                        "task %s created session %s on host %s (phase=%s, retries=%d)",
+                        task.id, session_id, host_id, phase, retries,
                     )
                     return session_id
                 detail = f"{resp.status_code} {resp.text[:300]}"
                 last_error = f"omnigent session create failed: {detail}"
                 retryable = (
                     "workspace path does not exist" in resp.text
-                    and asyncio.get_running_loop().time() < deadline
+                    and loop.time() < deadline
                 )
                 if not retryable:
                     break
+                retries += 1
+                elapsed = loop.time() - started_at
                 logger.warning(
                     "task %s workspace path not ready on host %s; retrying session create: %s",
                     task.id, host_id, resp.text[:200],
                 )
+                if progress is not None:
+                    await progress(
+                        "create_session", "running",
+                        f"workspace folder not materialized on the dev host yet "
+                        f"(attempt {retries}) — dev/start returns before the runner's "
+                        f"mkdir + clone finish; retrying… {elapsed:.0f}s elapsed",
+                    )
                 if (task.compassx_app_id or "").strip():
                     try:
                         from app.compassx import compassx
 
                         status = await compassx.dev_status(task.compassx_app_id)
                         if str(status.get("status") or "").lower() != "active":
-                            logger.warning(
-                                "task %s dev sandbox no longer active: %s",
-                                task.id, {k: status.get(k) for k in ("status", "host_online")},
+                            msg = (
+                                f"dev sandbox status={status.get('status')}, "
+                                f"host_online={status.get('host_online')} — waiting for it "
+                                "to recover before the next session-create attempt"
                             )
+                            logger.warning("task %s %s", task.id, msg)
+                            if progress is not None:
+                                await progress("create_session", "running", msg)
                     except Exception as exc:  # noqa: BLE001 — dev/status is best-effort here
                         logger.warning("task %s dev/status refresh failed: %s", task.id, exc)
                 await asyncio.sleep(settings.host_start_poll_interval_seconds)

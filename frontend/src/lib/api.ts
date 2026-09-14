@@ -112,6 +112,7 @@ export interface Task {
   session_id: string | null
   session_link: string | null
   session_provider: string | null
+  session_status: string | null
   depends_on: string[]
   created_at: string
   updated_at: string

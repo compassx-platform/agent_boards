@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from app.models import Task
@@ -28,6 +29,12 @@ class ExecutionResult:
     session_link: str = ""
 
 
+# (name, status, detail) live-progress callback — same contract as the host
+# provisioning step recorder. Adapters use it to surface sub-progress (e.g. the
+# retry loop behind session creation) onto the task's provisioning checklist.
+ProgressCallback = Callable[[str, str, str], Awaitable[None]]
+
+
 class AgentAdapter(abc.ABC):
     """Pluggable adapter between the orchestrator and an agent backend."""
 
@@ -46,13 +53,20 @@ class AgentAdapter(abc.ABC):
         before its first attempt may start. Default: no provisioning stage."""
         return False
 
-    async def provision(self, task: Task, phase: str = "execute") -> str | None:
+    async def provision(
+        self,
+        task: Task,
+        phase: str = "execute",
+        progress: ProgressCallback | None = None,
+    ) -> str | None:
         """Bring the execution host to readiness, possibly creating the agent
         session. Return the session/execution id to REUSE once the host is
         ready, or None while the host is still being set up — the orchestrator
         re-invokes this on its escalating timer until it is ready or the task is
         blocked. Only called for tasks where needs_provisioning() is True.
-        Raise on fatal errors; readiness-agnostic conditions return None."""
+        Raise on fatal errors; readiness-agnostic conditions return None.
+        ``progress`` lets long-running steps push live sub-progress onto the
+        UI's provisioning checklist (e.g. every session-create retry)."""
         return None
 
     @abc.abstractmethod

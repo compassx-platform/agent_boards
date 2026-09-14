@@ -215,10 +215,14 @@ class Orchestrator:
                 return False
             await self._record_step(
                 db, task, "create_session", "running",
-                "creating agent session on the Omnigent server",
+                "creating the agent session on the Omnigent server — the dev host's "
+                "workspace folder is still materializing (dev/start returns before "
+                "mkdir + clone finish), so this retries until the session is accepted",
             )
             try:
-                session_id = await self.adapter.provision(task, entry["phase"])
+                session_id = await self.adapter.provision(
+                    task, entry["phase"], progress=self._step_recorder(db, task)
+                )
             except Exception as exc:
                 entry["last_error"] = str(exc)
                 await self._record_step(db, task, "create_session", "failed", str(exc)[:200])
@@ -234,7 +238,8 @@ class Orchestrator:
             task.session_id = session_id
             db.commit()
             await self._record_step(
-                db, task, "create_session", "done", f"session {session_id} created",
+                db, task, "create_session", "done",
+                f"agent session {session_id} created on the Omnigent server (host {task.host_id})",
             )
             entry["last_error"] = None
             return await self._finish_provisioning(db, task, entry, changed)
@@ -441,7 +446,12 @@ class Orchestrator:
             entry = self._running[task_id]
             status: ExecutionStatus = await self.adapter.poll(entry["execution_id"])
             if status.session:
-                st = "running" if status.running else ("failed" if status.state == "failed" else "finished")
+                # Surface the session's LIVE state (whatever the agent backend
+                # reports — e.g. running/idle/failed) so the UI can show the
+                # session status in the task while it executes.
+                st = str(status.state or "").lower() or (
+                    "running" if status.running else "finished"
+                )
                 self._record_session(db, task_id, entry["execution_id"], status.session, st)
             if not status.running:
                 await self._finish_execution(db, task_id, changed)

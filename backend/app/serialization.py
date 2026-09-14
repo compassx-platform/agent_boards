@@ -120,6 +120,9 @@ def serialize_task(db: Session, task: Task) -> dict:
         "session_id": task.session_id or (active_session.session_id if active_session else None),
         "session_link": active_session.link if active_session else None,
         "session_provider": active_session.provider if active_session else None,
+        # The session's LIVE state as reported by the backend while it executes
+        # (e.g. running / idle / failed). Updated on every orchestrator poll.
+        "session_status": active_session.status if active_session else None,
         "depends_on": deps,
         "created_at": _dt(task.created_at),
         "updated_at": _dt(task.updated_at),
