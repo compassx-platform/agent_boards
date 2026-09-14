@@ -191,6 +191,45 @@ async def proxy_omnigent_v1(request: Request, path: str):
     )
 
 
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def proxy_omnigent_health(request: Request):
+    """Proxy /health checks to Omnigent Server (batch session liveness, runner status)."""
+    url = f"{settings.omnigent_api_url}/health"
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    if settings.omnigent_api_key:
+        headers["authorization"] = f"Bearer {settings.omnigent_api_key}"
+    params = dict(request.query_params)
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.request(request.method, url, headers=headers, params=params)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
+        media_type=resp.headers.get("content-type"),
+    )
+
+
+@app.api_route("/auth/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"])
+async def proxy_omnigent_auth(request: Request, path: str):
+    """Transparent proxy for /auth to Omnigent Server."""
+    url = f"{settings.omnigent_api_url}/auth/{path}"
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    if settings.omnigent_api_key:
+        headers["authorization"] = f"Bearer {settings.omnigent_api_key}"
+    body = await request.body()
+    params = dict(request.query_params)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.request(request.method, url, headers=headers, params=params, content=body)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
+        media_type=resp.headers.get("content-type"),
+    )
+
+
 from pathlib import Path
 from fastapi.responses import FileResponse
 
