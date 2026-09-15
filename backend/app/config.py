@@ -1,5 +1,6 @@
 from pathlib import Path
-
+from urllib.parse import quote_plus
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -39,12 +40,73 @@ class Settings(BaseSettings):
     environment: str = "development"
     api_prefix: str = "/api/v1"
 
-    # NOTE: the /workspaces mount is CIFS/SMB where SQLite file-locking is
-    # unreliable, so structured state lives on the local overlay filesystem
-    # by default. Point DATABASE_URL at Postgres for a production deployment.
-    database_url: str = "sqlite:////root/.taskexec/taskexec.db"
-    data_dir: Path = Path("/root/.taskexec")
-    artifacts_dir: Path = Path("/root/.taskexec/artifacts")
+    # PostgreSQL Connection Parameters & URL
+    pg_host: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "pg_host", "PG_HOST", "pghost", "PGHOST", "postgres_host", "POSTGRES_HOST", "TASKEXEC_PG_HOST"
+        ),
+    )
+    pg_port: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "pg_port", "PG_PORT", "pgport", "PGPORT", "postgres_port", "POSTGRES_PORT", "TASKEXEC_PG_PORT"
+        ),
+    )
+    pg_user: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "pg_user", "PG_USER", "pguser", "PGUSER", "postgres_user", "POSTGRES_USER", "TASKEXEC_PG_USER"
+        ),
+    )
+    pg_password: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "pg_password", "PG_PASSWORD", "pgpassword", "PGPASSWORD", "postgres_password", "POSTGRES_PASSWORD", "TASKEXEC_PG_PASSWORD"
+        ),
+    )
+    pg_database: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "pg_database", "PG_DATABASE", "pg_db", "PG_DB", "pgdatabase", "PGDATABASE", "postgres_db", "POSTGRES_DB", "TASKEXEC_PG_DATABASE"
+        ),
+    )
+    database_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "database_url", "DATABASE_URL", "postgres_url", "POSTGRES_URL", "TASKEXEC_DATABASE_URL"
+        ),
+    )
+
+    data_dir: Path = Field(
+        default=BASE_DIR / "data",
+        validation_alias=AliasChoices("data_dir", "DATA_DIR", "TASKEXEC_DATA_DIR"),
+    )
+    artifacts_dir: Path = Field(
+        default=BASE_DIR / "data" / "artifacts",
+        validation_alias=AliasChoices("artifacts_dir", "ARTIFACTS_DIR", "TASKEXEC_ARTIFACTS_DIR"),
+    )
+
+    @model_validator(mode="after")
+    def assemble_database_url(self) -> "Settings":
+        if self.pg_host or self.pg_user or self.pg_port or self.pg_database or self.pg_password:
+            host = self.pg_host or "localhost"
+            port = str(self.pg_port or "5432")
+            user = quote_plus(self.pg_user or "postgres")
+            password = quote_plus(self.pg_password or "")
+            db = self.pg_database or "taskexec"
+            auth = f"{user}:{password}@" if user or password else ""
+            self.database_url = f"postgresql+psycopg2://{auth}{host}:{port}/{db}"
+        elif self.database_url:
+            url = self.database_url.strip()
+            if url.startswith("postgres://"):
+                url = "postgresql+psycopg2://" + url[len("postgres://"):]
+            elif url.startswith("postgresql://"):
+                url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+            self.database_url = url
+        else:
+            self.database_url = "postgresql+psycopg2://postgres:postgres@localhost:5432/taskexec"
+        return self
 
     agent_capacity: int = 5
     # Baseline for the runtime "session status polling interval" setting (in the
@@ -53,14 +115,10 @@ class Settings(BaseSettings):
     poll_interval_seconds: float = 10.0
     max_execution_seconds: int = 600
 
-    # Adapter: "opencode" (real headless opencode CLI agent, the default) or
-    # "simulated" (deterministic demo backend, no real work) / "omnigent"
-    # (Omnigent server sessions — needs authenticated model creds on the host).
-    # The lifecycle is identical either way: a plan_required task goes
-    # backlog (human approval gate) → queued → executing(plan) →
-    # needs_review(plan approval) → queued → executing(implement) →
-    # verifying → done/needs_review.
-    adapter: str = "opencode"
+    # Adapter: "omnigent" (Omnigent server sessions, the default) or
+    # "opencode" (real headless opencode CLI agent) / "simulated"
+    # (deterministic demo backend, no real work).
+    adapter: str = "omnigent"
 
     # Headless opencode CLI execution backend (real work, real PRs).
     opencode_bin: str = "opencode"
@@ -74,7 +132,7 @@ class Settings(BaseSettings):
     # session id is appended). Leave empty to capture session ids only.
     opencode_session_link_base: str = "opencode://session/"
 
-    omnigent_api_url: str = "http://compassx-omnigent-server.compassx.svc.cluster.local:6767"
+    omnigent_api_url: str = "https://devstudio.135.13.180.167.nip.io"
     omnigent_api_key: str = ""
 
     # CompassX platform integration. Execution of a task bound to a CompassX

@@ -2,8 +2,11 @@ import path from 'node:path'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { defineConfig, type Plugin } from 'vite'
+import { shikiManualChunk } from './vite.shiki.ts'
+import { streamdownManualChunk } from './vite.streamdown.ts'
 
-const BACKEND_TARGET = 'http://localhost:8000'
+const BACKEND_TARGET = process.env.BACKEND_TARGET || `http://127.0.0.1:${process.env.BACKEND_PORT || '8000'}`
+const FRONTEND_PORT = Number(process.env.PORT || process.env.FRONTEND_PORT || 8080)
 
 const LOOKBEHIND_REWRITES: [string, string][] = [
   ['new RegExp("(?<=1)(?<!1)")', 'new globalThis.RegExp("(?<=1)(?<!1)")'],
@@ -48,16 +51,18 @@ export default defineConfig({
   plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src/omnigent'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   server: {
+    port: FRONTEND_PORT,
     host: true,
     allowedHosts: true,
-    fs: {
-      allow: ['..', '/tmp/omnigent_repo'],
+    watch: {
+      usePolling: true,
+      interval: 2000,
+      ignored: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/.cache/**'],
     },
-    watch: { usePolling: true, interval: 100 },
     proxy: {
       '/api': {
         target: BACKEND_TARGET,
@@ -104,4 +109,11 @@ export default defineConfig({
       },
     },
   },
-})
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: (id: string) => streamdownManualChunk(id) ?? shikiManualChunk(id),
+      },
+    },
+  },
+})

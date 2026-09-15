@@ -18,6 +18,9 @@ dist/
 # Runtime data / dev databases
 *.sqlite
 *.sqlite3
+*.db
+*.db-*
+data/
 /tmp/
 /logs/
 

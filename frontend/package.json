@@ -4,8 +4,6 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "predev": "bash ./scripts/ensure-deps.sh",
-    "prebuild": "bash ./scripts/ensure-deps.sh",
     "dev": "vite",
     "build": "vite build",
     "type-check": "tsc -b",

@@ -110,17 +110,18 @@ class AgentAdapter(abc.ABC):
     async def cancel(self, execution_id: str) -> bool: ...
 
 
-def get_adapter(name: str) -> AgentAdapter:
-    if name == "simulated":
-        from app.adapters.simulated import SimulatedAgent
-
-        return SimulatedAgent()
-    if name == "omnigent":
+def get_adapter(name: str | None = None) -> AgentAdapter:
+    adapter_name = (name or "").strip().lower() or "omnigent"
+    if adapter_name == "omnigent":
         from app.adapters.omnigent import OmnigentAgent
 
         return OmnigentAgent()
-    if name == "opencode":
+    if adapter_name == "simulated":
+        from app.adapters.simulated import SimulatedAgent
+
+        return SimulatedAgent()
+    if adapter_name == "opencode":
         from app.adapters.opencode import OpenCodeAgent
 
         return OpenCodeAgent()
-    raise ValueError(f"Unknown adapter: {name}")
+    raise ValueError(f"Unknown adapter: {adapter_name}")

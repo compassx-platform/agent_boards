@@ -44,7 +44,14 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -181,14 +188,21 @@ async def proxy_omnigent_v1(request: Request, path: str):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.request(request.method, url, headers=headers, params=params, content=body)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
-        media_type=resp.headers.get("content-type"),
-    )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.request(request.method, url, headers=headers, params=params, content=body)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
+            media_type=resp.headers.get("content-type"),
+        )
+    except Exception as exc:
+        return Response(
+            content=f'{{"detail":"Upstream Omnigent server unavailable: {exc}"}}',
+            status_code=502,
+            media_type="application/json",
+        )
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
@@ -200,14 +214,17 @@ async def proxy_omnigent_health(request: Request):
     if settings.omnigent_api_key:
         headers["authorization"] = f"Bearer {settings.omnigent_api_key}"
     params = dict(request.query_params)
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.request(request.method, url, headers=headers, params=params)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
-        media_type=resp.headers.get("content-type"),
-    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.request(request.method, url, headers=headers, params=params)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
+            media_type=resp.headers.get("content-type"),
+        )
+    except Exception:
+        return Response(content='{"status":"offline"}', status_code=200, media_type="application/json")
 
 
 @app.api_route("/auth/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"])
@@ -220,14 +237,17 @@ async def proxy_omnigent_auth(request: Request, path: str):
         headers["authorization"] = f"Bearer {settings.omnigent_api_key}"
     body = await request.body()
     params = dict(request.query_params)
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(request.method, url, headers=headers, params=params, content=body)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
-        media_type=resp.headers.get("content-type"),
-    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.request(request.method, url, headers=headers, params=params, content=body)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={k: v for k, v in resp.headers.items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}},
+            media_type=resp.headers.get("content-type"),
+        )
+    except Exception:
+        return Response(content='{"authenticated": false}', status_code=200, media_type="application/json")
 
 
 from pathlib import Path
@@ -244,38 +264,50 @@ async def proxy_omnigent_assets(path: str):
         return FileResponse(local_file)
 
     url = f"{settings.omnigent_api_url}/assets/{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
-        media_type=resp.headers.get("content-type"),
-    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+            media_type=resp.headers.get("content-type"),
+        )
+    except Exception:
+        return Response(content="Not Found", status_code=404)
 
 
 @app.api_route("/favicon.svg", methods=["GET"])
 async def proxy_omnigent_favicon():
     url = f"{settings.omnigent_api_url}/favicon.svg"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-    return Response(content=resp.content, status_code=resp.status_code, media_type="image/svg+xml")
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url)
+        return Response(content=resp.content, status_code=resp.status_code, media_type="image/svg+xml")
+    except Exception:
+        return Response(content='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">📋</text></svg>', media_type="image/svg+xml")
 
 
 @app.api_route("/apple-touch-icon.png", methods=["GET"])
 async def proxy_omnigent_touch_icon():
     url = f"{settings.omnigent_api_url}/apple-touch-icon.png"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-    return Response(content=resp.content, status_code=resp.status_code, media_type="image/png")
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url)
+        return Response(content=resp.content, status_code=resp.status_code, media_type="image/png")
+    except Exception:
+        return Response(content=b"", status_code=404)
 
 
 @app.api_route("/.well-known/{path:path}", methods=["GET"])
 async def proxy_omnigent_well_known(path: str):
     url = f"{settings.omnigent_api_url}/.well-known/{path}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-    return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+    except Exception:
+        return Response(content=b"", status_code=404)
 
 
 @app.api_route("/omnigent-app", methods=["GET"])
@@ -284,36 +316,50 @@ async def proxy_omnigent_well_known(path: str):
 async def proxy_omnigent_app(path: str = ""):
     """Serve the official Omnigent SPA HTML with client router bootstrapping."""
     url = f"{settings.omnigent_api_url}/{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
 
-    content = resp.content
-    content_type = resp.headers.get("content-type", "")
-    if "text/html" in content_type:
-        html_str = content.decode("utf-8")
-        shim = """<script>
+        content = resp.content
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" in content_type:
+            html_str = content.decode("utf-8")
+            shim = """<script>
 (function() {
   try {
     if (window.location.pathname.startsWith('/omnigent-app')) {
       var realPath = window.location.pathname.replace(/^\\/omnigent-app/, '') || '/';
-      window.history.replaceState(null, '', realPath + window.location.search + window.location.hash);
+      window.history.history.replaceState(null, '', realPath + window.location.search + window.location.hash);
     }
   } catch (e) {
     console.error('Omnigent URL bootstrap error:', e);
   }
 })();
 </script>"""
-        if "<head>" in html_str:
-            html_str = html_str.replace("<head>", "<head>" + shim, 1)
-        elif "<html" in html_str:
-            html_str = html_str.replace(">", ">" + shim, 1)
-        content = html_str.encode("utf-8")
+            if "<head>" in html_str:
+                html_str = html_str.replace("<head>", "<head>" + shim, 1)
+            elif "<html" in html_str:
+                html_str = html_str.replace(">", ">" + shim, 1)
+            content = html_str.encode("utf-8")
 
-    return Response(
-        content=content,
-        status_code=resp.status_code,
-        headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"},
-    )
+        return Response(
+            content=content,
+            status_code=resp.status_code,
+            headers={"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache"},
+        )
+    except Exception:
+        placeholder = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Omnigent App</title></head>
+<body style="font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+  <div style="text-align:center;max-width:500px;padding:2rem;">
+    <div style="font-size:2.5rem;margin-bottom:1rem;">🤖</div>
+    <h2 style="color:#f0f6fc;margin-bottom:0.5rem;">Omnigent Server Not Connected</h2>
+    <p style="color:#8b949e;font-size:0.9rem;line-height:1.5;">The Omnigent backend at <code style="background:#161b22;padding:0.2rem 0.4rem;border-radius:4px;color:#58a6ff;">{settings.omnigent_api_url}</code> is currently unreachable. You are running in local simulation mode.</p>
+  </div>
+</body>
+</html>"""
+        return Response(content=placeholder, status_code=200, media_type="text/html")
 
 
 @app.get("/board")

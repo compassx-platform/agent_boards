@@ -1003,6 +1003,8 @@ def metrics(db: Session = Depends(get_session)) -> dict:
         "escalation_count": escalations,
         "avg_attempts": avg_attempts,
         "capability_failures": capability_fail,
+        "adapter": settings.adapter,
+        "harness": settings.omnigent_default_harness,
     }
 
 
