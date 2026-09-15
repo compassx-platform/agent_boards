@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from app.adapters import AgentAdapter, ExecutionResult, ExecutionStatus
+from app.adapters import AgentAdapter, ExecutionResult, ExecutionStatus, ProgressCallback
 from app.config import settings
 from app.models import Task
 
@@ -52,6 +52,38 @@ class OmnigentAgent(AgentAdapter):
         return True
 
     # ---------------------------------------------------------------- helpers
+
+    async def _session_request(self, task: Task, phase: str, attempt_number: int) -> dict:
+        """Resolve agent/host/workspace and build the POST /v1/sessions body."""
+        agent_id, agent_name = await self._agent_for(task, phase)
+        harness = (task.harness or "").strip() or settings.omnigent_default_harness
+        host_id = (task.host_id or "").strip() or settings.omnigent_host_id
+        if (task.compassx_app_id or "").strip():
+            logger.info(
+                "task %s executes on CompassX host %s (%s, app %s)",
+                task.id, host_id, task.host_name, task.compassx_app_id,
+            )
+        elif host_id != settings.omnigent_host_id:
+            logger.info("task %s executes on host %s", task.id, host_id)
+        body: dict = {
+            "agent_id": agent_id,
+            "title": f"[{harness}] {task.title} (task {task.id[:8]})",
+            "host_id": host_id,
+            "workspace": self._workspace_for(task),
+        }
+        if phase == "implement":
+            body["git"] = {
+                "branch_name": (
+                    f"{settings.omnigent_branch_prefix}/{task.id[:8]}-{attempt_number}"
+                ),
+                "base_branch": "main",
+            }
+        return {
+            "body": body,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "harness": harness,
+        }
 
     async def _list_agents(self) -> list[dict]:
         """Live GET /v1/agents. Return [] and warn when unreachable."""
@@ -155,6 +187,37 @@ class OmnigentAgent(AgentAdapter):
             "say so explicitly and state the reason."
         )
 
+    async def _message_arrived(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        prompt: str,
+    ) -> bool:
+        """Return True if a user message with our prompt text reached the session."""
+        resp = await client.get(
+            f"{settings.omnigent_api_url}/v1/sessions/{session_id}/items",
+            headers=self._headers(),
+        )
+        if resp.status_code >= 400:
+            return False
+        needle = (prompt or "").strip()[:120]
+        if not needle:
+            return False
+        for item in resp.json().get("data", []):
+            if item.get("type") != "message" or item.get("role") != "user":
+                continue
+            content = item.get("content")
+            text = content if isinstance(content, str) else ""
+            if isinstance(content, list):
+                text = "\n".join(
+                    str(b.get("text", ""))
+                    for b in content
+                    if isinstance(b, dict) and b.get("text")
+                )
+            if needle in (text or ""):
+                return True
+        return False
+
     def _items_summary(self, items: list[dict]) -> tuple[str, list[str], list[str]]:
         """Return (assistant_text, tool_names, errors)."""
         text_parts: list[str] = []
@@ -187,7 +250,498 @@ class OmnigentAgent(AgentAdapter):
                         text_parts.append(str(block.get("text", "")))
         return "\n".join(text_parts), tools, errors
 
+    # ------------------------------------------------------ session browsing
+    # Read-only passthrough to the Omnigent server, backing the web Sessions
+    # page. Sessions/items are proxied live and deliberately NOT persisted by
+    # TaskExec (no transcript in the local DB) — the user browses what the
+    # server has right now. Errors degrade to (empty, message) so the UI can
+    # show "unavailable" instead of the orchestrator failing.
+
+    async def list_sessions(
+        self,
+        *,
+        kind: str | None = None,
+        search_query: str | None = None,
+        sort_by: str | None = None,
+        order: str = "desc",
+        limit: int = 100,
+        include_archived: bool = False,
+    ) -> tuple[list[dict], bool, str]:
+        """Proxy ``GET /v1/sessions`` -> (data, has_more, error)."""
+        params: dict[str, str | int] = {
+            "kind": kind or "any",
+            "order": order,
+            "limit": limit,
+        }
+        if search_query:
+            params["search_query"] = search_query
+        if sort_by:
+            params["sort_by"] = sort_by
+        if include_archived:
+            params["include_archived"] = "true"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/sessions",
+                    headers=self._headers(),
+                    params=params,
+                )
+            if resp.status_code >= 400:
+                return [], False, f"omnigent sessions {resp.status_code}"
+            body = resp.json()
+            return body.get("data", []), bool(body.get("has_more")), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], False, str(exc)
+
+    async def session_snapshot(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = False,
+    ) -> tuple[dict | None, str]:
+        """Proxy ``GET /v1/sessions/{id}`` -> (snapshot, error)."""
+        params = {
+            "include_items": "true" if include_items else "false",
+            "include_liveness": "true",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}",
+                    headers=self._headers(),
+                    params=params,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent session {resp.status_code}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def session_items(self, session_id: str) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/sessions/{id}/items``, paging to completion.
+
+        All committed conversation items in chronological order; no items are
+        stored locally. Returns (items, error) — partial items are returned
+        with a live error string if paging died part-way.
+        """
+        items: list[dict] = []
+        after: str | None = None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                while True:
+                    params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+                    if after:
+                        params["after"] = after
+                    resp = await client.get(
+                        f"{settings.omnigent_api_url}/v1/sessions/{session_id}/items",
+                        headers=self._headers(),
+                        params=params,
+                    )
+                    if resp.status_code >= 400:
+                        return items, f"omnigent items {resp.status_code}"
+                    body = resp.json()
+                    data = body.get("data", [])
+                    items.extend(data)
+                    if not body.get("has_more") or not data:
+                        return items, ""
+                    after = data[-1].get("id")
+                    if not after:
+                        return items, ""
+        except Exception as exc:  # noqa: BLE001
+            return items, str(exc)
+
+    async def create_session_direct(self, payload: dict) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/sessions`` -> (session, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent session create {resp.status_code}: {resp.text[:300]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def update_session(self, session_id: str, payload: dict) -> tuple[dict | None, str]:
+        """Proxy ``PATCH /v1/sessions/{id}`` -> (session, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.patch(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent session update {resp.status_code}: {resp.text[:300]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def delete_session(self, session_id: str) -> tuple[bool, str]:
+        """Proxy ``DELETE /v1/sessions/{id}`` -> (success, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.delete(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return False, f"omnigent session delete {resp.status_code}: {resp.text[:300]}"
+            return True, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    async def auto_title_session(self, session_id: str) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/sessions/{id}/auto-title`` -> (result, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/auto-title",
+                    headers=self._headers(),
+                    json={},
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent auto-title {resp.status_code}: {resp.text[:300]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def fork_session(self, source_id: str, payload: dict) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/sessions/{source_id}/fork`` -> (session, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions/{source_id}/fork",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent fork {resp.status_code}: {resp.text[:300]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def send_event(self, session_id: str, event: dict) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/sessions/{id}/events`` -> (response, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/events",
+                    headers=self._headers(),
+                    json=event,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent event {resp.status_code}: {resp.text[:300]}"
+            try:
+                return resp.json(), ""
+            except Exception:
+                return {"status": "ok", "status_code": resp.status_code}, ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def list_environments(self, session_id: str) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/sessions/{id}/resources/environments`` -> (envs, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/environments",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return [], f"omnigent environments {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            return data.get("data", []), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    async def get_environment_filesystem(
+        self, session_id: str, env_id: str, relative_path: str = ""
+    ) -> tuple[dict | list | None, str]:
+        """Proxy ``GET /v1/sessions/{id}/resources/environments/{env_id}/filesystem[/{path}]``."""
+        url = (
+            f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/environments/{env_id}/filesystem"
+        )
+        if relative_path.strip("/"):
+            url = f"{url}/{relative_path.strip('/')}"
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url, headers=self._headers())
+            if resp.status_code >= 400:
+                return None, f"omnigent filesystem {resp.status_code}: {resp.text[:200]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def get_environment_changes(self, session_id: str, env_id: str) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/sessions/{id}/resources/environments/{env_id}/changes``."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/environments/{env_id}/changes",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return [], f"omnigent changes {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            return data.get("data", []), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    async def search_environment(
+        self, session_id: str, env_id: str, query: str = ""
+    ) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/sessions/{id}/resources/environments/{env_id}/search``."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/environments/{env_id}/search",
+                    headers=self._headers(),
+                    params={"q": query} if query else {},
+                )
+            if resp.status_code >= 400:
+                return [], f"omnigent search {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            return data.get("data", []), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    async def list_terminals(self, session_id: str) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/sessions/{id}/resources/terminals``."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/terminals",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return [], f"omnigent terminals {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            return data.get("data", []), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    async def create_terminal(self, session_id: str, payload: dict) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/sessions/{id}/resources/terminals``."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/terminals",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent terminal create {resp.status_code}: {resp.text[:200]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def delete_terminal(self, session_id: str, terminal_id: str) -> tuple[bool, str]:
+        """Proxy ``DELETE /v1/sessions/{id}/resources/terminals/{terminal_id}``."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.delete(
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/resources/terminals/{terminal_id}",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return False, f"omnigent terminal delete {resp.status_code}: {resp.text[:200]}"
+            return True, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    async def list_agents_full(self) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/agents`` -> (agents, error)."""
+        rows = await self._list_agents()
+        if not rows:
+            return [], "no agents returned from omnigent"
+        return rows, ""
+
+    async def list_hosts_full(self) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/hosts`` -> (hosts, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/hosts",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return [], f"omnigent hosts {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            return data.get("hosts", data.get("data", [])), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    async def list_scheduled_tasks(self) -> tuple[list[dict], str]:
+        """Proxy ``GET /v1/scheduled-tasks`` -> (tasks, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{settings.omnigent_api_url}/v1/scheduled-tasks",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return [], f"omnigent scheduled-tasks {resp.status_code}: {resp.text[:200]}"
+            data = resp.json()
+            return data.get("scheduled_tasks", data.get("data", [])), ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    async def create_scheduled_task(self, payload: dict) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/scheduled-tasks`` -> (task, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/scheduled-tasks",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent scheduled-task create {resp.status_code}: {resp.text[:200]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def run_scheduled_task(self, scheduled_task_id: str) -> tuple[dict | None, str]:
+        """Proxy ``POST /v1/scheduled-tasks/{id}/run`` -> (result, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/scheduled-tasks/{scheduled_task_id}/run",
+                    headers=self._headers(),
+                    json={},
+                )
+            if resp.status_code >= 400:
+                return None, f"omnigent scheduled-task run {resp.status_code}: {resp.text[:200]}"
+            return resp.json(), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc)
+
+    async def delete_scheduled_task(self, scheduled_task_id: str) -> tuple[bool, str]:
+        """Proxy ``DELETE /v1/scheduled-tasks/{id}`` -> (success, error)."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.delete(
+                    f"{settings.omnigent_api_url}/v1/scheduled-tasks/{scheduled_task_id}",
+                    headers=self._headers(),
+                )
+            if resp.status_code >= 400:
+                return False, f"omnigent scheduled-task delete {resp.status_code}: {resp.text[:200]}"
+            return True, ""
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
     # ------------------------------------------------------------- interface
+
+    def needs_provisioning(self, task: Task) -> bool:
+        """CompassX-bound tasks run a remote dev host that needs to be brought
+        up and confirmed ready before any attempt starts."""
+        return bool((task.compassx_app_id or "").strip())
+
+    async def provision(
+        self,
+        task: Task,
+        phase: str = "execute",
+        progress: ProgressCallback | None = None,
+    ) -> str:
+        """Create the execution session during host bring-up. This doubles as
+        the host-readiness check: the dev host's workspace folder materializes
+        asynchronously (dev/start can return before mkdir + git clone finish on
+        the runner), so this delegates to create_session's bounded
+        workspace-ready retry. ``progress`` is forwarded to create_session so
+        every retry is surfaced live on the provisioning checklist. Once
+        created, the session is reused by later attempts (the orchestrator
+        guards against double-create via task.session_id).
+        """
+        return await self.create_session(
+            task, phase, task.current_attempt, progress=progress
+        )
+
+    async def create_session(
+        self,
+        task: Task,
+        phase: str = "execute",
+        attempt_number: int | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> str:
+        """Create exactly ONE fresh Omnigent session for the task (with the
+        workspace-materialization retry). Used on the first attempt and by the
+        explicit "new session" endpoint; every later attempt reuses the session
+        the orchestrator persists on the task. Returns the new session id.
+
+        The Omnigent dev host's workspace folder materializes asynchronously —
+        dev/start returns before the runner's mkdir + clone finish — so a
+        session create that hits "workspace path does not exist" is retried
+        until the deadline. ``progress`` (when given) pushes each retry's state:
+        attempt number, elapsed time, and the underlying reason, so the UI can
+        explain why this step is slow instead of sitting on a generic spinner.
+        """
+        req = await self._session_request(
+            task, phase,
+            attempt_number if attempt_number is not None else task.current_attempt,
+        )
+        body = req["body"]
+        host_id = body["host_id"]
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        deadline = started_at + settings.host_start_max_wait_seconds
+        last_error: str | None = None
+        retries = 0
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                resp = await client.post(
+                    f"{settings.omnigent_api_url}/v1/sessions",
+                    headers=self._headers(),
+                    json=body,
+                )
+                if resp.status_code < 400:
+                    session_id = resp.json()["id"]
+                    logger.info(
+                        "task %s created session %s on host %s (phase=%s, retries=%d)",
+                        task.id, session_id, host_id, phase, retries,
+                    )
+                    return session_id
+                detail = f"{resp.status_code} {resp.text[:300]}"
+                last_error = f"omnigent session create failed: {detail}"
+                retryable = (
+                    "workspace path does not exist" in resp.text
+                    and loop.time() < deadline
+                )
+                if not retryable:
+                    break
+                retries += 1
+                elapsed = loop.time() - started_at
+                logger.warning(
+                    "task %s workspace path not ready on host %s; retrying session create: %s",
+                    task.id, host_id, resp.text[:200],
+                )
+                if progress is not None:
+                    await progress(
+                        "create_session", "running",
+                        f"workspace folder not materialized on the dev host yet "
+                        f"(attempt {retries}) — dev/start returns before the runner's "
+                        f"mkdir + clone finish; retrying… {elapsed:.0f}s elapsed",
+                    )
+                if (task.compassx_app_id or "").strip():
+                    try:
+                        from app.compassx import compassx
+
+                        status = await compassx.dev_status(task.compassx_app_id)
+                        if str(status.get("status") or "").lower() != "active":
+                            msg = (
+                                f"dev sandbox status={status.get('status')}, "
+                                f"host_online={status.get('host_online')} — waiting for it "
+                                "to recover before the next session-create attempt"
+                            )
+                            logger.warning("task %s %s", task.id, msg)
+                            if progress is not None:
+                                await progress("create_session", "running", msg)
+                    except Exception as exc:  # noqa: BLE001 — dev/status is best-effort here
+                        logger.warning("task %s dev/status refresh failed: %s", task.id, exc)
+                await asyncio.sleep(settings.host_start_poll_interval_seconds)
+        raise RuntimeError(last_error)
 
     async def submit(
         self,
@@ -196,52 +750,67 @@ class OmnigentAgent(AgentAdapter):
         attempt_id: str,
         artifacts_dir: str,
         phase: str = "execute",
+        session_id: str | None = None,
     ) -> str:
-        agent_id, agent_name = await self._agent_for(task, phase)
-        harness = (task.harness or "").strip() or settings.omnigent_default_harness
-        body: dict = {
-            "agent_id": agent_id,
-            "title": f"[{harness}] {task.title} (task {task.id[:8]})",
-            "host_id": settings.omnigent_host_id,
-            "workspace": self._workspace_for(task),
-        }
-        if phase == "implement":
-            body["git"] = {
-                "branch_name": (
-                    f"{settings.omnigent_branch_prefix}/{task.id[:8]}-{attempt_number}"
-                ),
-                "base_branch": "main",
-            }
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{settings.omnigent_api_url}/v1/sessions",
-                headers=self._headers(),
-                json=body,
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(f"omnigent session create failed: {resp.status_code} {resp.text[:300]}")
-            session = resp.json()
-            session_id = session["id"]
+        req = await self._session_request(task, phase, attempt_number)
+        agent_id = req["agent_id"]
+        agent_name = req["agent_name"]
+        harness = req["harness"]
+        body = req["body"]
+        host_id = body["host_id"]
 
-            event = {
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": self._prompt_for(task, phase, attempt_number),
-                        }
-                    ],
-                },
-            }
-            eresp = await client.post(
-                f"{settings.omnigent_api_url}/v1/sessions/{session_id}/events",
-                headers=self._headers(),
-                json=event,
-            )
-            if eresp.status_code >= 400:
-                raise RuntimeError(f"omnigent message dispatch failed: {eresp.status_code} {eresp.text[:300]}")
+        if session_id is None:
+            session_id = await self.create_session(task, phase, attempt_number)
+
+        prompt = self._prompt_for(task, phase, attempt_number)
+        event = {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            },
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            dispatch_error: Exception | None = None
+            for _ in range(2):
+                dispatch_error = None
+                try:
+                    eresp = await client.post(
+                        f"{settings.omnigent_api_url}/v1/sessions/{session_id}/events",
+                        headers=self._headers(),
+                        json=event,
+                    )
+                except httpx.HTTPError as exc:
+                    dispatch_error = exc
+                else:
+                    if eresp.status_code < 400:
+                        break
+                    dispatch_error = RuntimeError(
+                        f"omnigent message dispatch failed: {eresp.status_code} {eresp.text[:300]}"
+                    )
+                # A transport-level timeout/error is ambiguous: the server may
+                # have accepted the event anyway. Verify delivery before
+                # resending or failing, so a slow-but-successful dispatch is
+                # never double-sent nor counted as a failed attempt.
+                try:
+                    arrived = await self._message_arrived(client, session_id, prompt)
+                except Exception as exc:  # noqa: BLE001 — verification is best-effort
+                    logger.warning(
+                        "task %s dispatch verification failed for session %s: %s",
+                        task.id, session_id, exc,
+                    )
+                    arrived = False
+                if arrived:
+                    logger.warning(
+                        "task %s events dispatch to session %s reported failure (%s) "
+                        "but the message was delivered; continuing",
+                        task.id, session_id, dispatch_error,
+                    )
+                    dispatch_error = None
+                    break
+                await asyncio.sleep(2)
+            if dispatch_error:
+                raise dispatch_error
 
         Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
         self._exec[session_id] = {

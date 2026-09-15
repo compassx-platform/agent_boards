@@ -18,6 +18,9 @@ dist/
 # Runtime data / dev databases
 *.sqlite
 *.sqlite3
+*.db
+*.db-*
+data/
 /tmp/
 /logs/
 
@@ -35,3 +38,6 @@ dist/
 
 # Node (belt-and-suspenders; frontend/.gitignore is authoritative)
 node_modules/
+
+# Agent scratch/test artifacts
+mtime-test-*/

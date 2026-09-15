@@ -67,14 +67,25 @@ def session_out(s: "ExecutionSession") -> dict:
         "session_id": s.session_id,
         "link": s.link,
         "status": s.status,
+        "archived": s.archived,
         "created_at": _dt(s.created_at),
     }
+
+
+def _steps_out(raw: str | None) -> list[dict]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def serialize_task(db: Session, task: Task) -> dict:
     deps = [d.id for d in task.deps(db)]
     latest_pr = next((a.pr_url for a in reversed(task.attempts) if a.pr_url), None)
-    latest_session = task.sessions[-1] if task.sessions else None
+    active_session = next((s for s in reversed(task.sessions) if not s.archived), None)
     return {
         "id": task.id,
         "title": task.title,
@@ -86,16 +97,32 @@ def serialize_task(db: Session, task: Task) -> dict:
         "agent_capability": task.agent_capability,
         "harness": task.harness,
         "workspace": task.workspace,
+        "compassx_app_id": task.compassx_app_id,
+        "compassx_app_name": task.compassx_app_name,
+        "compassx_workspace_id": task.compassx_workspace_id,
+        "compassx_workspace_name": task.compassx_workspace_name,
+        "compassx_published": task.compassx_published,
+        "host_id": task.host_id,
+        "host_name": task.host_name,
+        "dev_url": task.dev_url,
+        "provisioning_steps": _steps_out(task.provisioning_steps),
         "current_attempt": task.current_attempt,
         "max_attempts": task.max_attempts,
         "escalation_reason": task.escalation_reason,
         "plan_required": task.plan_required,
         "plan_status": task.plan_status,
         "plan_text": task.plan_text,
+        "bypass_verification": task.bypass_verification,
+        "verification_bypass_outcome": task.verification_bypass_outcome,
         "pr_url": latest_pr,
-        "session_id": latest_session.session_id if latest_session else None,
-        "session_link": latest_session.link if latest_session else None,
-        "session_provider": latest_session.provider if latest_session else None,
+        # The task's single ACTIVE session (prefers the owned id, falls back to
+        # the newest recorded non-archived row). Archived sessions are history.
+        "session_id": task.session_id or (active_session.session_id if active_session else None),
+        "session_link": active_session.link if active_session else None,
+        "session_provider": active_session.provider if active_session else None,
+        # The session's LIVE state as reported by the backend while it executes
+        # (e.g. running / idle / failed). Updated on every orchestrator poll.
+        "session_status": active_session.status if active_session else None,
         "depends_on": deps,
         "created_at": _dt(task.created_at),
         "updated_at": _dt(task.updated_at),

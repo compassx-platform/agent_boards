@@ -246,6 +246,7 @@ class OpenCodeAgent(AgentAdapter):
         attempt_id: str,
         artifacts_dir: str,
         phase: str = "execute",
+        session_id: str | None = None,
     ) -> str:
         ws = self._workspace_for(task)
         workdir = Path(ws)
