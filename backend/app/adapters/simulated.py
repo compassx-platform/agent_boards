@@ -38,6 +38,7 @@ class SimulatedAgent(AgentAdapter):
         attempt_id: str,
         artifacts_dir: str,
         phase: str = "execute",
+        session_id: str | None = None,
     ) -> str:
         self._seq += 1
         execution_id = f"sim-{int(time.time())}-{self._seq}"

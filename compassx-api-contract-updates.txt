@@ -1,0 +1,149 @@
+Yes, there are **two enhancements** to the API contract that make it much easier for **Agent Boards** to create and manage custom workspaces and folder names.
+
+Here is the updated contract writeup ready to share with the Agent Boards team:
+
+---
+
+# CompassX & Omnigent API Contract for Agent Boards (Updated)
+
+### Base URL
+- **CompassX API**: `https://compassx.135.13.180.167.nip.io/api/v1`
+- **Databricks Omnigent Server**: `https://devstudio.135.13.180.167.nip.io`
+
+---
+
+## 1. List Deployed Apps (For Dropdown)
+Fetches all available apps deployed on CompassX.
+- **Endpoint**: `GET /api/v1/apps`
+- **Response**:
+```json
+[
+  {
+    "id": "59f99ff8a7854a50",
+    "name": "Enterprise Asset Management (EAM)",
+    "slug": "eam",
+    "git_repo_url": "https://github.com/org/eam.git",
+    "git_branch": "main",
+    "status": "deployed"
+  }
+]
+```
+
+---
+
+## 2. List Existing Workspaces for Selected App
+Before creating a new workspace, Agent Boards can query existing workspaces to reuse an earlier workspace if a task needs to be redone.
+- **Endpoint**: `GET /api/v1/apps/{app_id}/dev/workspaces`
+- **Response**:
+```json
+[
+  {
+    "id": "task-102",
+    "name": "task-102",
+    "folder_path": "app-59f99ff8a7854a50/task-102",
+    "git_branch": "main",
+    "status": "active",
+    "created_at": "2026-09-13T02:30:00Z",
+    "last_active_at": "2026-09-13T02:35:00Z"
+  }
+]
+```
+
+---
+
+## 3. Create a Custom Dev Workspace (NEW)
+Agent Boards can now explicitly create a workspace with a specific task name. The workspace name and the physical folder on disk / Omnigent will be **identical**.
+- **Endpoint**: `POST /api/v1/apps/{app_id}/dev/workspaces`
+- **Request Body**:
+```json
+{
+  "name": "task-102",
+  "git_branch": "main"
+}
+```
+- **Response (200 OK)**:
+```json
+{
+  "id": "task-102",
+  "name": "task-102",
+  "folder_path": "app-59f99ff8a7854a50/task-102",
+  "git_branch": "main",
+  "status": "inactive",
+  "created_at": "2026-09-13T02:30:00Z",
+  "already_exists": false
+}
+```
+*(Note: If a workspace with this name already exists, `already_exists: true` is returned and existing metadata is provided).*
+
+---
+
+## 4. Start Dev Pod & Attach Workspace (UPDATED)
+Starts the Kubernetes dev container for the app, mounts the workspace folder, and connects the host to Omnigent Server.
+
+You can provide either `workspace_name` (NEW) or `workspace_id` (or both):
+- **Endpoint**: `POST /api/v1/apps/{app_id}/dev/start`
+- **Request Body**:
+```json
+{
+  "workspace_name": "task-102",
+  "workspace_id": "task-102"
+}
+```
+- **Response**:
+```json
+{
+  "app_id": "59f99ff8a7854a50",
+  "status": "active",
+  "workspace_id": "task-102",
+  "workspace_name": "task-102",
+  "workspace_folder": "app-59f99ff8a7854a50/task-102",
+  "host_id": "3b1c67d3e5f24e4d89a714a60183b9cf",
+  "host_name": "Enterprise Asset Management (EAM)",
+  "host_online": true,
+  "omnigent_session_id": "sess_omnigent_59f99ff8a7854a50",
+  "omnigent_session_url": "https://devstudio.135.13.180.167.nip.io/#/session/sess_omnigent_59f99ff8a7854a50",
+  "dev_url": "https://eam-dev.135.13.180.167.nip.io"
+}
+```
+
+---
+
+## 5. Pass Task / Create Session in Omnigent Server
+Once the Dev Pod is active (`host_online: true`), Agent Boards dispatches the coding task to Omnigent Server bound to this workspace and host.
+- **Endpoint**: `POST https://devstudio.135.13.180.167.nip.io/v1/sessions`
+- **Request Body**:
+```json
+{
+  "title": "Task 102: Fix work order status transition bug",
+  "host_id": "3b1c67d3e5f24e4d89a714a60183b9cf",
+  "workspace": "/workspaces/app-59f99ff8a7854a50/task-102"
+}
+```
+- **Response**:
+```json
+{
+  "id": "sess_89f0291ba632",
+  "status": "ready",
+  "workspace": "/workspaces/app-59f99ff8a7854a50/task-102",
+  "host_id": "3b1c67d3e5f24e4d89a714a60183b9cf"
+}
+```
+
+---
+
+## 6. Publish Changes & Deploy to Production
+When task execution is complete and verified:
+- **Endpoint**: `POST /api/v1/apps/{app_id}/dev/publish`
+- **Request Body**:
+```json
+{
+  "commit_message": "feat(task-102): completed automated task execution"
+}
+```
+
+---
+
+### Key Summary of What Changed
+1. **Workspace Name = Folder Name**: No random hash prefixes or date stamps in folder names. If you pass `task-102`, the workspace name is `task-102` and the folder path is `/workspaces/app-{app_id}/task-102`.
+2. **New Endpoint**: `POST /api/v1/apps/{app_id}/dev/workspaces` lets Agent Boards pre-create workspaces explicitly.
+3. **`POST /dev/start`**: Accepts `workspace_name` directly.

@@ -12,12 +12,14 @@ from sqlalchemy.orm import Session
 
 from app.adapters import get_adapter
 from app.audit import log_action
+from app.compassx import compassx
 from app.config import CHECK_TYPES, PRIORITIES, RISK_RULES, RISK_TIERS, settings
 from app.db import get_session
 from app.events import bus
-from app.models import AuditLog, Attempt, ContextRef, Criterion, Task, TaskDependency
+from app.models import AuditLog, Attempt, ContextRef, Criterion, ExecutionSession, Task, TaskDependency
 from app.orchestrator import orchestrator
 from app.serialization import serialize_task
+from app import settings_service
 from app.state_machine import transition
 
 router = APIRouter(prefix="", tags=["taskexec"])
@@ -42,6 +44,10 @@ class CriterionIn(BaseModel):
         return v
 
 
+class SettingsIn(BaseModel):
+    settings: dict[str, object] = {}
+
+
 class TaskCreate(BaseModel):
     title: str
     intent: str = ""
@@ -50,8 +56,13 @@ class TaskCreate(BaseModel):
     agent_capability: str = "default"
     max_attempts: int | None = None
     plan_required: bool = False
+    bypass_verification: bool = True
+    verification_bypass_outcome: str = "needs_review"
     workspace: str | None = None
     harness: str | None = None
+    compassx_app_id: str | None = None
+    compassx_app_name: str | None = None
+    compassx_workspace_id: str | None = None
     context: list[ContextRefIn] = []
     criteria: list[CriterionIn] = []
     depends_on: list[str] = []
@@ -68,6 +79,13 @@ class TaskCreate(BaseModel):
     def risk_valid(cls, v: str) -> str:
         if v not in RISK_TIERS:
             raise ValueError(f"risk_tier must be one of {RISK_TIERS}")
+        return v
+
+    @field_validator("verification_bypass_outcome")
+    @classmethod
+    def bypass_outcome_valid(cls, v: str) -> str:
+        if v not in {"done", "needs_review"}:
+            raise ValueError("verification_bypass_outcome must be 'done' or 'needs_review'")
         return v
 
 
@@ -111,8 +129,13 @@ def _build_task(db: Session, payload: TaskCreate, user: str) -> Task:
         status="backlog",
         plan_required=payload.plan_required,
         plan_status="none",
+        bypass_verification=payload.bypass_verification,
+        verification_bypass_outcome=payload.verification_bypass_outcome,
         workspace=(payload.workspace or "").strip() or None,
         harness=(payload.harness or "").strip() or settings.omnigent_default_harness,
+        compassx_app_id=(payload.compassx_app_id or "").strip() or None,
+        compassx_app_name=(payload.compassx_app_name or "").strip() or None,
+        compassx_workspace_id=(payload.compassx_workspace_id or "").strip() or None,
     )
     db.add(task)
     db.flush()
@@ -286,7 +309,78 @@ def unblock_task(task_id: str, request: Request, db: Session = Depends(get_sessi
         raise HTTPException(status_code=404, detail="task not found")
     if task.status != "blocked":
         raise HTTPException(status_code=409, detail="task is not blocked")
+    task.current_attempt = 0
+    task.not_before = None
+    task.escalation_reason = None
     transition(db, task, "queued", actor=_current_user(request), reason="manually unblocked")
+    db.commit()
+    return serialize_task(db, task)
+
+
+@router.post("/tasks/{task_id}/new_session")
+def new_session(
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+) -> dict:
+    """Start a brand-new agent session for the task.
+
+    The task owns exactly one ACTIVE agent session (persisted as
+    task.session_id) reused over every attempt/retry. "New session" ARCHIVES the
+    current active session (a flag — never deleted, always visible in history)
+    and drops the task's active handle, so the next dispatch creates a fresh
+    session only because none is active anymore. At most one active session
+    exists per task at any time.
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    old_session = task.session_id
+    user = _current_user(request)
+
+    # Archive the task's currently active session(s) — flag only, never delete.
+    archived: list[str] = []
+    for srow in (
+        db.query(ExecutionSession)
+        .filter(
+            ExecutionSession.task_id == task_id,
+            ExecutionSession.archived.is_(False),
+        )
+        .all()
+    ):
+        if old_session and srow.session_id == old_session:
+            if srow.status in {"running", None}:
+                srow.status = "finished"
+        srow.archived = True
+        archived.append(srow.session_id)
+    if old_session and old_session != task_id and old_session not in archived:
+        # The active session was created (provisioning) but never polled into an
+        # ExecutionSession row yet — record it so the archive isn't lost.
+        db.add(
+            ExecutionSession(
+                task_id=task_id,
+                provider="omnigent",
+                session_id=old_session,
+                link=f"{settings.omnigent_api_url}/sessions/{old_session}",
+                status="finished",
+                archived=True,
+            )
+        )
+        archived.append(old_session)
+
+    task.session_id = None
+    task.current_attempt = 0
+    task.not_before = None
+    task.escalation_reason = None
+    if task.status in {"blocked", "rejected", "needs_review"}:
+        transition(
+            db, task, "queued", actor=user,
+            reason=f"new session requested (archived {old_session or '(none)'})",
+        )
+    log_action(
+        db, task, "archive_session", actor=user, to_status=task.status,
+        reason=f"archived active session {old_session or '(none)'}; next dispatch creates a fresh active session",
+    )
     db.commit()
     return serialize_task(db, task)
 
@@ -356,6 +450,431 @@ async def harnesses() -> dict:
     }
 
 
+@router.get("/omnigent/sessions")
+async def omnigent_sessions(
+    kind: str | None = Query(default=None),
+    search_query: str | None = Query(default=None),
+    sort_by: str | None = Query(default=None),
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    include_archived: bool = Query(default=False),
+) -> dict:
+    """Session browsing list, proxied live from the Omnigent server.
+
+    Read-only passthrough of ``GET /v1/sessions``: nothing is persisted here,
+    the page always reflects what the server has right now.
+    """
+    from app.adapters.omnigent import OmnigentAgent
+
+    sessions, has_more, err = await OmnigentAgent().list_sessions(
+        kind=kind,
+        search_query=search_query,
+        sort_by=sort_by,
+        order=order,
+        limit=limit,
+        include_archived=include_archived,
+    )
+    return {
+        "source": "live" if not err else "unavailable",
+        "sessions": sessions,
+        "has_more": has_more,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}")
+async def omnigent_session_snapshot(session_id: str) -> dict:
+    """Session snapshot (identity, status, labels) proxied live."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    session, err = await OmnigentAgent().session_snapshot(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/items")
+async def omnigent_session_items(session_id: str) -> dict:
+    """Full conversation items for a session, proxied live (not stored)."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    items, err = await OmnigentAgent().session_items(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "items": items,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions")
+async def omnigent_create_session(request: Request) -> dict:
+    """Create a new Omnigent session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    session, err = await OmnigentAgent().create_session_direct(body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.patch("/omnigent/sessions/{session_id}")
+async def omnigent_update_session(session_id: str, request: Request) -> dict:
+    """Update Omnigent session attributes (title, labels, archived)."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    session, err = await OmnigentAgent().update_session(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.delete("/omnigent/sessions/{session_id}")
+async def omnigent_delete_session(session_id: str) -> dict:
+    """Delete an Omnigent session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    success, err = await OmnigentAgent().delete_session(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "success": success,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/auto-title")
+async def omnigent_auto_title(session_id: str) -> dict:
+    """Automatically generate a concise title for a session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    result, err = await OmnigentAgent().auto_title_session(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "result": result,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/fork")
+async def omnigent_fork_session(session_id: str, request: Request) -> dict:
+    """Fork an existing session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    session, err = await OmnigentAgent().fork_session(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "session": session,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/events")
+async def omnigent_send_event(session_id: str, request: Request) -> dict:
+    """Send an event / user turn / interrupt / elicitation response to a session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    resp, err = await OmnigentAgent().send_event(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "response": resp,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/stream")
+async def omnigent_session_stream(session_id: str):
+    """Proxy live SSE stream from Omnigent server."""
+    headers = {"Authorization": f"Bearer {settings.omnigent_api_key}"} if settings.omnigent_api_key else {}
+
+    async def event_generator():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "GET",
+                    f"{settings.omnigent_api_url}/v1/sessions/{session_id}/stream",
+                    headers=headers,
+                ) as resp:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+        except Exception as exc:
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n".encode()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/omnigent/sessions/{session_id}/environments")
+async def omnigent_environments(session_id: str) -> dict:
+    """List session environments."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    envs, err = await OmnigentAgent().list_environments(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "environments": envs,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/environments/{env_id}/filesystem")
+async def omnigent_filesystem(
+    session_id: str, env_id: str, path: str = Query(default="")
+) -> dict:
+    """Read file content or list folder entries in session environment."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    data, err = await OmnigentAgent().get_environment_filesystem(session_id, env_id, path)
+    return {
+        "source": "live" if not err else "unavailable",
+        "data": data,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/environments/{env_id}/changes")
+async def omnigent_environment_changes(session_id: str, env_id: str) -> dict:
+    """List git / filesystem changes in session environment."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    changes, err = await OmnigentAgent().get_environment_changes(session_id, env_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "changes": changes,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/environments/{env_id}/search")
+async def omnigent_environment_search(
+    session_id: str, env_id: str, q: str = Query(default="")
+) -> dict:
+    """Search files in session environment."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    results, err = await OmnigentAgent().search_environment(session_id, env_id, q)
+    return {
+        "source": "live" if not err else "unavailable",
+        "results": results,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/sessions/{session_id}/terminals")
+async def omnigent_terminals(session_id: str) -> dict:
+    """List terminals for a session."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    terminals, err = await OmnigentAgent().list_terminals(session_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "terminals": terminals,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/sessions/{session_id}/terminals")
+async def omnigent_create_terminal(session_id: str, request: Request) -> dict:
+    """Create / launch a terminal on the session host."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    terminal, err = await OmnigentAgent().create_terminal(session_id, body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "terminal": terminal,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.delete("/omnigent/sessions/{session_id}/terminals/{terminal_id}")
+async def omnigent_delete_terminal(session_id: str, terminal_id: str) -> dict:
+    """Close a session terminal."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    success, err = await OmnigentAgent().delete_terminal(session_id, terminal_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "success": success,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/agents")
+async def omnigent_agents() -> dict:
+    """List all registered agents on the Omnigent server."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    agents, err = await OmnigentAgent().list_agents_full()
+    return {
+        "source": "live" if not err else "unavailable",
+        "agents": agents,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/hosts")
+async def omnigent_hosts() -> dict:
+    """List all registered hosts and runner capabilities on the Omnigent server."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    hosts, err = await OmnigentAgent().list_hosts_full()
+    return {
+        "source": "live" if not err else "unavailable",
+        "hosts": hosts,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/omnigent/scheduled-tasks")
+async def omnigent_scheduled_tasks() -> dict:
+    """List scheduled cron tasks."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    tasks, err = await OmnigentAgent().list_scheduled_tasks()
+    return {
+        "source": "live" if not err else "unavailable",
+        "scheduled_tasks": tasks,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/scheduled-tasks")
+async def omnigent_create_scheduled_task(request: Request) -> dict:
+    """Create a new scheduled task."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    body = await request.json()
+    task, err = await OmnigentAgent().create_scheduled_task(body)
+    return {
+        "source": "live" if not err else "unavailable",
+        "scheduled_task": task,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.post("/omnigent/scheduled-tasks/{task_id}/run")
+async def omnigent_run_scheduled_task(task_id: str) -> dict:
+    """Run a scheduled task immediately."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    result, err = await OmnigentAgent().run_scheduled_task(task_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "result": result,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.delete("/omnigent/scheduled-tasks/{task_id}")
+async def omnigent_delete_scheduled_task(task_id: str) -> dict:
+    """Delete a scheduled task."""
+    from app.adapters.omnigent import OmnigentAgent
+
+    success, err = await OmnigentAgent().delete_scheduled_task(task_id)
+    return {
+        "source": "live" if not err else "unavailable",
+        "success": success,
+        "error": err or None,
+        "base_url": settings.omnigent_api_url,
+    }
+
+
+@router.get("/compassx/apps")
+async def compassx_apps() -> dict:
+    """CompassX applications (populates the per-task app picker).
+
+    Execution of a task bound to one of these apps spins up the app's remote
+    dev host first, verifies it is online on the Omnigent server, then runs the
+    agent session on that host.
+    """
+    try:
+        apps = await compassx.list_apps()
+    except Exception as exc:  # noqa: BLE001 - surface reachability to the UI
+        return {"apps": [], "error": str(exc), "configured": compassx.enabled}
+    return {"apps": apps, "error": None, "configured": compassx.enabled}
+
+
+@router.get("/compassx/apps/{app_id}/dev/workspaces")
+async def compassx_dev_workspaces(app_id: str) -> dict:
+    """Existing dev workspaces for an app (used to resume work instead of a fresh clone)."""
+    try:
+        workspaces = await compassx.list_dev_workspaces(app_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"workspaces": [], "error": str(exc)}
+    return {"workspaces": workspaces, "error": None}
+
+
+class CompassXWorkspaceCreate(BaseModel):
+    name: str
+    git_branch: str = "main"
+
+
+@router.post("/compassx/apps/{app_id}/dev/workspaces")
+async def compassx_dev_workspaces_create(app_id: str, payload: CompassXWorkspaceCreate) -> dict:
+    """Pre-create a named dev workspace (workspace name == physical folder).
+    Idempotent: an existing name returns the workspace with already_exists=true."""
+    try:
+        workspace = await compassx.create_dev_workspace(
+            app_id, payload.name, payload.git_branch
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"workspace": {}, "error": str(exc)}
+    return {"workspace": workspace, "error": None}
+
+
+@router.get("/compassx/apps/{app_id}/dev/status")
+async def compassx_dev_status(app_id: str) -> dict:
+    """Health of the app's dev sandbox + Omnigent host connection."""
+    try:
+        status = await compassx.dev_status(app_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    return {"dev": status}
+
+
+@router.post("/compassx/apps/{app_id}/dev/stop")
+async def compassx_dev_stop(app_id: str) -> dict:
+    """Stop the app's dev sandbox (frees cluster compute)."""
+    try:
+        result = await compassx.dev_stop(app_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    return {"dev": result}
+
+
 @router.post("/parse")
 def parse_intent(payload: ParseRequest) -> dict:
     """Conversational task creation (heuristic stand-in — wire an LLM here for Phase 3)."""
@@ -420,6 +939,11 @@ def parse_intent(payload: ParseRequest) -> dict:
     if m:
         harness = m.group(1).strip().lower()
 
+    compassx_app_id = None
+    m = re.search(r"\bapp\s*[:=]\s*(app_[A-Za-z0-9_-]+)", text, re.IGNORECASE)
+    if m:
+        compassx_app_id = m.group(1).strip()
+
     return {
         "parsed": {
             "title": title,
@@ -430,6 +954,7 @@ def parse_intent(payload: ParseRequest) -> dict:
             "plan_required": plan_required,
             "workspace": ws,
             "harness": harness,
+            "compassx_app_id": compassx_app_id,
             "criteria": criteria,
         },
         "confidence": 0.6,
@@ -437,10 +962,30 @@ def parse_intent(payload: ParseRequest) -> dict:
     }
 
 
+@router.get("/settings")
+def get_settings(db: Session = Depends(get_session)) -> dict:
+    return {
+        "settings": settings_service.get_settings(db),
+        "definitions": settings_service.definitions(),
+    }
+
+
+@router.put("/settings")
+def update_settings(payload: SettingsIn, db: Session = Depends(get_session)) -> dict:
+    try:
+        updated = settings_service.update_settings(db, dict(payload.settings or {}))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {
+        "settings": updated,
+        "definitions": settings_service.definitions(),
+    }
+
+
 @router.get("/metrics")
 def metrics(db: Session = Depends(get_session)) -> dict:
     counts: dict[str, int] = {s: db.query(Task).filter(Task.status == s).count() for s in [
-        "backlog", "queued", "executing", "verifying", "needs_review", "done", "rejected", "blocked"
+        "backlog", "queued", "host_provisioning", "executing", "verifying", "needs_review", "done", "rejected", "blocked"
     ]}
     escalations = db.query(AuditLog).filter(AuditLog.action == "escalation").count()
     attempts = db.query(Attempt).filter(Attempt.verification_result != None).all()  # noqa: E711
@@ -458,6 +1003,8 @@ def metrics(db: Session = Depends(get_session)) -> dict:
         "escalation_count": escalations,
         "avg_attempts": avg_attempts,
         "capability_failures": capability_fail,
+        "adapter": settings.adapter,
+        "harness": settings.omnigent_default_harness,
     }
 
 
@@ -472,6 +1019,7 @@ async def stream_events() -> StreamingResponse:
 
 @router.post("/demo/seed")
 def seed_demo(db: Session = Depends(get_session)) -> dict:
+    apps_enabled = bool((settings.compassx_api_token or "").strip())
     samples = [
         {
             "title": "Add plaid support to the checkout flow",
@@ -483,6 +1031,14 @@ def seed_demo(db: Session = Depends(get_session)) -> dict:
             "context": [
                 {"type": "link", "ref": "https://github.com/compassx-platform/agent_boards", "description": "repo"},
             ],
+        },
+        {
+            "title": "Bump checkout UI copy for v0.3",
+            "intent": "Update the checkout page copy and empty-state text on the Agent Boards app deployed in the CompassX dev sandbox.",
+            "priority": "normal",
+            "risk_tier": "low",
+            "compassx_app_id": "app_59f99ff8a7854a50" if apps_enabled else None,
+            "compassx_app_name": "Agent Boards" if apps_enabled else None,
         },
         {
             "title": "Write release notes for v0.2",

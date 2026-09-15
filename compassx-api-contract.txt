@@ -1,0 +1,329 @@
+Viewed app_dev_routes.py:1-150
+Viewed app_dev_routes.py:150-239
+Viewed omnigent_dev_service.py:1-120
+Viewed omnigent_dev_service.py:120-260
+Viewed omnigent_dev_service.py:260-400
+Viewed app_task_routes.py:1-150
+Searched for "omnigent_server"
+Viewed manager.py:1-100
+
+# API Integration Contract: Agent Boards ↔ CompassX Platform & Omnigent
+
+This contract defines the specification for **Agent Boards** to integrate with **CompassX Platform** and **Omnigent Server** to execute coding tasks in isolated application dev sandboxes.
+
+---
+
+## 1. Architecture & Workflow Overview
+
+```
+ ┌────────────────┐
+ │  Agent Boards  │ (User creates/selects task, picks App from dropdown)
+ └───────┬────────┘
+         │
+         │ 1. GET /api/v1/apps (Populate app dropdown)
+         │ 2. GET /api/v1/apps/{app_id}/dev/workspaces (Check previous workspaces)
+         │ 3. POST /api/v1/apps/{app_id}/dev/start (Start Dev Pod + Connect Omnigent Host)
+         ▼
+ ┌───────────────────────────┐
+ │ CompassX Platform Backend │
+ └───────┬───────────────────┘
+         │
+         ├────────────────────────────────────────┐
+         │ (Launches K8s Dev Pod)                 │ (Checks/Ensures Server)
+         ▼                                        ▼
+ ┌───────────────────────────┐        ┌───────────────────────────┐
+ │  K8s Dev Sandbox Pod      │        │      Omnigent Server      │
+ │  (App Code + Vite/API +   │───────►│  (AI Agent Orchestration  │
+ │   Omnigent Host Runner)   │ Host   │   Engine & Tool Executor) │
+ └───────────────────────────┘ Hand-  └─────────────▲─────────────┘
+                               shake                │
+                                                    │ 4. POST /v1/sessions
+                                                    │ 5. POST /v1/sessions/{id}/prompt
+                                                    │ 6. Stream events & logs
+                                          ┌─────────┴────────┐
+                                          │   Agent Boards   │
+                                          └──────────────────┘
+```
+
+---
+
+## 2. Authentication & Base URLs
+
+### Base URLs
+* **CompassX API Base URL**: `https://<COMPASSX_HOST>/api/v1` *(or internal: `http://compassx-backend.compassx.svc.cluster.local:8000/api/v1`)*
+* **Omnigent Server Base URL**: `https://<OMNIGENT_HOST>` *(or internal: `http://compassx-omnigent-server.compassx.svc.cluster.local:6767`)*
+
+### Headers
+Every request to CompassX must include:
+```http
+Authorization: Bearer <COMPASSX_API_TOKEN>
+Content-Type: application/json
+X-Workspace-Id: <WORKSPACE_ID>        # Optional if using token default
+X-Workspace-Slug: <WORKSPACE_SLUG>    # Optional (e.g. 'default')
+```
+
+---
+
+## 3. CompassX API Endpoints
+
+### 3.1 List Applications (For Task Creation Dropdown)
+Retrieves all applications registered in the workspace so the user can select which app a task belongs to.
+
+* **Endpoint**: `GET /api/v1/apps`
+* **Query Params**:
+  * `workspace_slug` *(optional, string)*: Filter by workspace.
+
+#### Response (`200 OK`):
+```json
+[
+  {
+    "id": "app_59f99ff8a7854a50",
+    "name": "Agent Boards",
+    "slug": "agent-boards",
+    "description": "Agent Kanban and execution board",
+    "app_type": "react",
+    "status": "active",
+    "route": "/agent-boards",
+    "git_repo_url": "https://github.com/compassx-platform/agent_boards.git",
+    "git_branch": "main",
+    "created_at": "2026-09-11T12:00:00Z"
+  }
+]
+```
+
+---
+
+### 3.2 List Dev Workspaces for an App
+Retrieves existing dev workspace directories for an app. Agent Boards uses this to let users pick an existing workspace when redoing a task or creating a new one.
+
+* **Endpoint**: `GET /api/v1/apps/{app_id}/dev/workspaces`
+
+#### Response (`200 OK`):
+```json
+[
+  {
+    "id": "ws_945bbda579d44d4d",
+    "name": "ws-Sep13-0131",
+    "folder_path": "app-59f99ff8a7854a50/ws_945bbda579d44d4d",
+    "git_branch": "main",
+    "status": "active",
+    "created_at": "2026-09-13T01:31:00Z",
+    "last_active_at": "2026-09-13T01:45:00Z"
+  }
+]
+```
+
+---
+
+### 3.3 Start / Resume Dev Pod & Connect Host
+Starts the Kubernetes Dev Pod for the chosen app, mounts the workspace, boots the runtime dev servers, and connects the Omnigent Host runner to the Omnigent Server.
+
+* **Endpoint**: `POST /api/v1/apps/{app_id}/dev/start`
+* **Request Body**:
+```json
+{
+  "workspace_id": "ws_945bbda579d44d4d" 
+}
+```
+> **Note**: 
+> - If `workspace_id` is provided: Resumes and mounts the existing workspace (ideal for redoing tasks).
+> - If `workspace_id` is `null` or omitted: CompassX automatically initializes a **new workspace directory** with a fresh clone of the git repository.
+
+#### Response (`200 OK`):
+```json
+{
+  "app_id": "app_59f99ff8a7854a50",
+  "app_identifier": "compassx-app-app-59f99ff8a7854a50",
+  "status": "active",
+  "mode": "kubernetes",
+  "container_name": "compassx-app-dev-app-59f99ff8a7854a50",
+  "dev_url": "https://compassx.example.com/apps/agent-boards-dev/",
+  "workspace_id": "ws_945bbda579d44d4d",
+  "workspace_name": "ws-Sep13-0131",
+  "folder_path": "app-59f99ff8a7854a50/ws_945bbda579d44d4d",
+  "host_id": "97e1d6b0299b58a7b4b8a7f1eeafaaf1",
+  "host_name": "agent boards",
+  "host_online": true,
+  "omnigent_server_url": "https://omnigent.example.com",
+  "omnigent_server_connected": true,
+  "session_id": "sess_omnigent_app_59f99ff8a7854a50",
+  "session_url": "https://omnigent.example.com/#/session/sess_omnigent_app_59f99ff8a7854a50"
+}
+```
+
+---
+
+### 3.4 Check Dev Sandbox & Host Health Status
+Checks if the dev container is healthy and connected to the Omnigent server.
+
+* **Endpoint**: `GET /api/v1/apps/{app_id}/dev/status`
+
+#### Response (`200 OK`):
+```json
+{
+  "status": "active",
+  "app_id": "app_59f99ff8a7854a50",
+  "host_id": "97e1d6b0299b58a7b4b8a7f1eeafaaf1",
+  "host_name": "agent boards",
+  "host_online": true,
+  "omnigent_server_connected": true,
+  "dev_url": "https://compassx.example.com/apps/agent-boards-dev/",
+  "workspace_id": "ws_945bbda579d44d4d"
+}
+```
+
+---
+
+### 3.5 Commit & Publish Changes to Git (Task Completion)
+Once the agent finishes the task and code is verified in the dev sandbox, Agent Boards can trigger a commit and push to Git.
+
+* **Endpoint**: `POST /api/v1/apps/{app_id}/dev/publish`
+* **Request Body**:
+```json
+{
+  "commit_message": "feat(tasks): implement automated workflow step #TASK-102"
+}
+```
+
+#### Response (`200 OK`):
+```json
+{
+  "success": true,
+  "commit_sha": "a1b2c3d4e5f67890",
+  "branch": "main",
+  "redeploy_triggered": true
+}
+```
+
+---
+
+### 3.6 Stop Dev Sandbox
+Stops the dev container when tasks are complete or idle to save cluster compute resources.
+
+* **Endpoint**: `POST /api/v1/apps/{app_id}/dev/stop`
+
+#### Response (`200 OK`):
+```json
+{
+  "status": "stopped",
+  "app_id": "app_59f99ff8a7854a50"
+}
+```
+
+---
+
+## 4. Omnigent Server API Endpoints
+
+Once the dev pod is running, Agent Boards communicates with the **Omnigent Server** (`omnigent_server_url`) to run agent sessions and submit prompts.
+
+### 4.1 Check Connected Hosts
+* **Endpoint**: `GET /v1/hosts`
+#### Response (`200 OK`):
+```json
+{
+  "hosts": [
+    {
+      "host_id": "97e1d6b0299b58a7b4b8a7f1eeafaaf1",
+      "name": "agent boards",
+      "status": "online",
+      "workspaces": ["/workspaces"]
+    }
+  ]
+}
+```
+
+---
+
+### 4.2 Create Agent Execution Session Bound to Host
+* **Endpoint**: `POST /v1/sessions`
+* **Request Body**:
+```json
+{
+  "title": "Task: Implement Auth Middleware",
+  "agent_id": "polly",
+  "host_id": "97e1d6b0299b58a7b4b8a7f1eeafaaf1",
+  "workspace": "/workspaces"
+}
+```
+#### Response (`200 OK`):
+```json
+{
+  "id": "sess_8f9a0b1c2d3e",
+  "title": "Task: Implement Auth Middleware",
+  "agent_id": "polly",
+  "host_id": "97e1d6b0299b58a7b4b8a7f1eeafaaf1",
+  "status": "created"
+}
+```
+
+---
+
+### 4.3 Dispatch Task Prompt to Agent
+* **Endpoint**: `POST /v1/sessions/{session_id}/prompt` *(or `/v1/sessions/{session_id}/messages`)*
+* **Request Body**:
+```json
+{
+  "prompt": "You are assigned task #TASK-102: Add JWT authentication middleware in backend/app/auth.py and unit tests in tests/test_auth.py. Verify that tests pass.",
+  "stream": true
+}
+```
+
+---
+
+### 4.4 Stream Real-time Agent Progress (SSE)
+* **Endpoint**: `GET /v1/sessions/{session_id}/events` *(Server-Sent Events)*
+* **Event Stream Outputs**:
+  * `event: thinking` — Agent chain of thought.
+  * `event: tool_call` — Execution of commands (`npm test`, `git status`, file edits).
+  * `event: message` — Response and completion status.
+
+---
+
+## 5. End-to-End Implementation Flow for Agent Boards
+
+### Step 1: User Configures Task in Agent Boards UI
+1. User clicks **"Create Task"**.
+2. Agent Boards calls `GET /api/v1/apps` and renders the dropdown of apps.
+3. User selects the app (e.g. `app_59f99ff8a7854a50`).
+4. (Optional) User selects **"New Workspace"** (default) or picks an existing workspace from `GET /api/v1/apps/{app_id}/dev/workspaces`.
+
+### Step 2: Agent Boards Triggers Execution
+```typescript
+// 1. Start Dev Sandbox on CompassX
+const startRes = await axios.post(`/api/v1/apps/${appId}/dev/start`, {
+  workspace_id: isRedo ? existingWorkspaceId : null
+}, { headers });
+
+const { host_id, workspace_id, omnigent_server_url } = startRes.data;
+
+// Save workspace_id to the Task record in Agent Boards for future redo
+await updateTaskRecord(taskId, { compassx_workspace_id: workspace_id });
+
+// 2. Create Session on Omnigent Server
+const sessionRes = await axios.post(`${omnigent_server_url}/v1/sessions`, {
+  title: `Task #${taskId}: ${taskTitle}`,
+  agent_id: "polly",
+  host_id: host_id,
+  workspace: "/workspaces"
+});
+
+const sessionId = sessionRes.data.id;
+
+// 3. Send Task Prompt to Agent
+await axios.post(`${omnigent_server_url}/v1/sessions/${sessionId}/prompt`, {
+  prompt: taskDescription
+});
+
+// 4. Stream events and update Agent Boards live status (In Progress -> Review -> Done)
+```
+
+---
+
+## 6. Error Handling & Edge Cases
+
+| Error Scenario | Cause | Recommended Agent Boards Action |
+| :--- | :--- | :--- |
+| **`404 Not Found` on `/start`** | Invalid `app_id` | Refresh apps list from `GET /api/v1/apps`. |
+| **`host_online: false`** | Dev Pod starting up / container pulling | Poll `GET /api/v1/apps/{app_id}/dev/status` every 2s (up to 30s) until `host_online: true`. |
+| **`OOM / 500 Error`** | App exceeded memory limits | CompassX is preconfigured with 3.5GB memory limits. Check pod logs via `GET /api/v1/apps/{app_id}/dev/logs`. |
+| **Redo Task Workspace Missing** | Workspace folder was deleted | Fall back to `workspace_id: null` to generate a fresh workspace. |
